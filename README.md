@@ -1,6 +1,7 @@
 # 机加工工序放行后端
 
-单件机加工工序的检验登记、开工 / 完工放行、量具失准隔离与质量员复核服务。
+单件机加工工序的检验登记、开工 / 完工放行、量具失准隔离与质量员复核服务，
+外加班组之间的**工位交接**（工位缓冲位、件、调拨单、分批签收 / 退回）。
 技术栈：Python + FastAPI + SQLite（标准库 `sqlite3`，无 ORM）。
 
 ## 1. 领域模型与状态
@@ -74,7 +75,125 @@
 > `app/services.py` 中 `register_gauge_window` 的注释），语义等价且结果稳定，
 > 并由 `tests/test_quarantine.py` 回归覆盖。
 
-## 5. HTTP 接口（前缀 `/api`）
+## 5. 工位交接
+
+### 5.1 模型
+
+- **工位 workstation**：固定容量 `capacity` 的缓冲位，一件占一位。
+- **件 piece**：用**已有工件编号**登记的一件实物。一件对应一个工件，登记时指定其
+  **初始工位**和一道属于该件的**转运关口工序**。不复制任何检验 / 完工记录；关口
+  有效性始终实时读取该工序的当前状态与现有放行规则。
+- **调拨单 transfer_order**：指定不同的发件 / 收件工位，以及一批在发件方的件。
+- **缓冲位槽 workstation_slot**：`ACTUAL`（实物在位）或 `RESERVED`（已预留、尚无
+  实物）。**两者都占用容量**。工位查询分别返回 `actual_pieces` / `reserved_pieces`，
+  以及剩余的 `available`。
+
+### 5.2 容量与位次账本
+
+| 时点 | 发件方 | 收件方 |
+| --- | --- | --- |
+| 件初次登记 | `ACTUAL`（HOME） | — |
+| 建单（待发） | `ACTUAL` | `RESERVED`（RECEIPT，为每件留好收件位） |
+| 发运（在途） | `RESERVED`（RETURN，每件的退回位置，不得接纳别的件） | `RESERVED`（RECEIPT） |
+| 签收落地 | 释放该件 RETURN 预留 | 该件 RECEIPT 由 `RESERVED` → `ACTUAL` |
+| 退回落地 | 该件 RETURN 由 `RESERVED` → `ACTUAL` | 释放该件 RECEIPT 预留 |
+
+- **占用守恒**：建单、发运、单件落地都不改变两侧合计占用量，只是状态转换与
+  “预留哪件”的变化；因此发运不需要额外容量。
+- 一个工位的 `ACTUAL + RESERVED` 不得超过容量：应用层预检 + 数据库触发器双重保证。
+- 同一件同时最多在一张待发 / 在途单上（`transfer_order_piece` 的部分唯一索引
+  `released_at IS NULL`）。已落地（签收 / 退回）或被撤销的件 `released_at` 非空，
+  即可进入后续单据。
+- 待发单可撤销：释放收件方预留位、件留在发件方原位。已发运的单不能撤销。
+
+### 5.3 发运与落地规则
+
+1. **建单**只校验发 / 收工位不同、件当前在发件方且未被其它单占用，并立即留好
+   收件位；关口是否完工不在此拦截（可先建单留位，待关口完工后再发运）。
+2. **发运**要求单内**每一件**的关口当前都按现有工序规则**有效完工**
+   （`COMPLETED` 且本工序项目最新检验合格、量具在测量时刻有效、先决工序有效完工）。
+   有一件不满足则整单**仍待发**、返回 409。发运时把发件方各件的在库位就地转为
+   该件的退回保留位，占用不增加。
+3. **签收 / 退回**只处理**仍在途**的件，可分批，且互不影响单中其他件。
+   请求里只要有一件无法处理（不在单内 / 已落地 / 未在途），**整批不生效**。
+4. **质量变化不拒收**：关口已不再有效完工的件照常落地并留签收 / 退回记录，
+   但当前库存 `piece.quality_frozen = true`、`gate_valid = false`，**不能再次发运**。
+   复核 / 补测使关口恢复有效后，件的可用状态自动恢复；不改动任何历史落地记录，
+   也不移动实物。
+5. 单内全部件落地后单状态为 `COMPLETED`；否则保持 `SHIPPED` 继续分批处理。
+
+### 5.4 请求号幂等
+
+`ship` / `receive` / `return` 均接收 `request_id`，并按**调拨单**隔离：
+
+- 同 `request_id` + 同动作 + 同操作者 + 同一批件：返回首次成功结果（`replayed=true`），
+  不重复记账、不重复占用 / 释放位置；
+- 同 `request_id` 但动作 / 操作者 / 件批次任一不同：409，拒绝执行；
+- 失败请求不写幂等记录，因此不占号，可用同一号重试；
+- 幂等比较发生在 `BEGIN IMMEDIATE` 写锁内，两个终端同号并发只会有一个真正执行。
+
+### 5.5 并发与重启
+
+- 每个写操作在进程内锁之外，再以显式 `BEGIN IMMEDIATE` 事务取得 SQLite 写锁，
+  跨进程（两个终端）串行化；唯一索引与容量触发器作为最后一道防线。
+- 因此不会出现重复发运 / 重复落地 / 超占容量；发运瞬间实时读取关口状态，绝不
+  用缓存的旧完工状态通过发运。
+- 所有交接状态都落在同一个 SQLite 库中，重启后按原单（含件状态、位次、幂等记录）
+  继续处理。
+
+### 5.6 HTTP 接口（交接部分，前缀 `/api`）
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/workstations` | 建工位（`code`, `name`, `capacity`） |
+| GET | `/workstations` | 工位列表 |
+| GET | `/workstations/{id}` | 实际在位 / 已预留无实物 / 剩余位置 |
+| POST | `/pieces` | 登记实物（已有 `workpiece_id` + `gate_process_id` + 初始 `workstation_id`） |
+| GET | `/pieces` / `/pieces/{id}` | 每件现在在哪、是否质量冻结、占用哪张单 |
+| POST | `/transfer-orders` | 建单（发 / 收工位、件批次；即为每件预留收件位） |
+| GET | `/transfer-orders` / `/{id}` | 单列表 / 单详情（含落地记录：谁签收或退回了哪些件） |
+| POST | `/transfer-orders/{id}/cancel` | 撤销待发单，释放收件位 |
+| POST | `/transfer-orders/{id}/ship` | 整单发运（`operator`, `request_id`） |
+| POST | `/transfer-orders/{id}/receive` | 分批签收（`operator`, `request_id`, `piece_ids`） |
+| POST | `/transfer-orders/{id}/return` | 分批退回（同上） |
+
+### 5.7 通过 HTTP 完成一笔交接
+
+```bash
+B=http://127.0.0.1:8000/api
+
+# 0) 既有能力：建工件、登记检验、开工 / 完工，直到关口工序 COMPLETED
+#    （分别 POST /workpieces、/inspections、/processes/{id}/start、/complete）
+
+# 1) 建两个工位
+curl -X POST $B/workstations -H 'content-type: application/json' \
+  -d '{"code":"WS-SRC","name":"发件工位","capacity":3}'
+curl -X POST $B/workstations -H 'content-type: application/json' \
+  -d '{"code":"WS-DST","name":"收件工位","capacity":2}'
+
+# 2) 用已有工件登记实物：初始在发件工位，关口为该件的完工工序
+curl -X POST $B/pieces -H 'content-type: application/json' \
+  -d '{"workpiece_id":1,"gate_process_id":2,"workstation_id":1}'
+
+# 3) 建单：立即为件在收件方预留一个位（实物尚未移动）
+curl -X POST $B/transfer-orders -H 'content-type: application/json' \
+  -d '{"source_workstation_id":1,"dest_workstation_id":2,"piece_ids":[1]}'
+
+# 4) 扫码发运：整单关口须有效完工，发件方为每件保留退回位
+curl -X POST $B/transfer-orders/1/ship -H 'content-type: application/json' \
+  -d '{"operator":"张三","request_id":"SHIP-20261127-01"}'
+
+# 5) 分批签收到收件方（也可 POST .../return 退回发件方）
+curl -X POST $B/transfer-orders/1/receive -H 'content-type: application/json' \
+  -d '{"operator":"李四","request_id":"RCV-20261127-01","piece_ids":[1]}'
+
+# 6) 班组长查询
+curl $B/workstations/2          # 实际在位 vs 已预留、剩余位置
+curl $B/pieces/1                # 每件实物在哪、是否质量冻结
+curl $B/transfer-orders/1       # 每件状态 + 谁签收 / 退回了哪些件
+```
+
+## 6. HTTP 接口（既有放行部分，前缀 `/api`）
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
@@ -100,7 +219,7 @@
 比较的 UTC 字符串，因此窗口比较可直接用 SQL 字符串比较。业务错误返回
 `409`（规则不满足 / 冲突）、`404`（实体不存在）、`422`（输入校验 / 环 / 窗口反向）。
 
-## 6. 运行与测试
+## 7. 运行与测试
 
 ```bash
 pip install -r requirements.txt
@@ -113,14 +232,14 @@ pip install -r requirements.txt
 pytest -q
 ```
 
-## 7. 目录结构
+## 8. 目录结构
 
 ```
 app/
   database.py   # SQLite 连接、PRAGMA、建表 DDL
   schemas.py    # Pydantic 请求 / 响应模型
-  services.py   # 全部业务规则、隔离传导、并发锁
+  services.py   # 全部业务规则、隔离传导、工位交接、跨进程写锁
   main.py       # FastAPI 路由与异常映射
-tests/          # 放行链路、隔离 / 复核、DAG 校验、并发、随机不变量
+tests/          # 放行链路、隔离 / 复核、DAG 校验、并发、随机不变量、工位交接
 run.sh          # 启动脚本
 ```

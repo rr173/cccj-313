@@ -180,3 +180,136 @@ class ProcessStatusOut(BaseModel):
     can_start: bool
     blocking_reasons: list[str]
     open_quarantine: Optional[QuarantineOut]
+
+
+# ---------- 工位交接 ----------
+
+class WorkstationCreate(BaseModel):
+    code: str = Field(min_length=1, max_length=64)
+    name: str = Field(min_length=1, max_length=128)
+    capacity: int = Field(ge=0, description="缓冲位数量，一件占一位")
+
+
+class WorkstationOut(BaseModel):
+    workstation_id: int
+    code: str
+    name: str
+    capacity: int
+    created_at: str
+
+
+class SlotOut(BaseModel):
+    slot_id: int
+    workstation_id: int
+    piece_id: int
+    state: str
+    purpose: str
+    order_id: Optional[int]
+    created_at: str
+
+
+class WorkstationDetailOut(WorkstationOut):
+    actual_count: int
+    reserved_count: int
+    available: int
+    # 实际在位的件
+    actual_pieces: list[int]
+    # 已预留但尚无实物的件（收件预留 / 退回保留）
+    reserved_pieces: list[int]
+    slots: list[SlotOut]
+
+
+class PieceCreate(BaseModel):
+    workpiece_id: int = Field(description="已有工件编号，不新建工件")
+    gate_process_id: int = Field(description="该工件的转运关口工序")
+    workstation_id: int = Field(description="实物初始工位")
+
+
+class PieceOut(BaseModel):
+    piece_id: int
+    workpiece_id: int
+    workpiece_code: str
+    gate_process_id: int
+    gate_process_code: str
+    status: str
+    current_workstation_id: int
+    current_workstation_code: str
+    # 关口当前是否仍按现有规则有效完工；冻结件不能再次发运
+    gate_valid: bool
+    quality_frozen: bool
+    active_order_id: Optional[int]
+    created_at: str
+
+
+class TransferOrderCreate(BaseModel):
+    source_workstation_id: int
+    dest_workstation_id: int
+    piece_ids: list[int] = Field(min_length=1)
+
+
+class TransferOrderPieceOut(BaseModel):
+    piece_id: int
+    workpiece_code: str
+    state: str
+    released_at: Optional[str]
+
+
+class TransferRecordOut(BaseModel):
+    record_id: int
+    order_id: int
+    action_id: int
+    piece_id: int
+    action: str
+    operator: str
+    request_id: str
+    from_workstation_id: int
+    to_workstation_id: int
+    created_at: str
+
+
+class TransferActionOut(BaseModel):
+    action_id: int
+    order_id: int
+    request_id: str
+    action: str
+    operator: str
+    piece_ids: list[int]
+    created_at: str
+
+
+class TransferOrderOut(BaseModel):
+    order_id: int
+    source_workstation_id: int
+    dest_workstation_id: int
+    status: str
+    created_at: str
+    shipped_at: Optional[str]
+    closed_at: Optional[str]
+    pieces: list[TransferOrderPieceOut]
+
+
+class TransferOrderDetailOut(TransferOrderOut):
+    # 每次发运 / 签收 / 退回的操作者与扫码请求号（按时间顺序）
+    actions: list[TransferActionOut]
+    # 逐件的签收 / 退回落地记录
+    records: list[TransferRecordOut]
+
+
+class TransferRequest(BaseModel):
+    operator: str = Field(min_length=1, max_length=64)
+    request_id: str = Field(min_length=1, max_length=128)
+
+
+class TransferBatchRequest(TransferRequest):
+    piece_ids: list[int] = Field(min_length=1)
+
+
+class TransferActionResult(BaseModel):
+    order_id: int
+    action: str
+    request_id: str
+    operator: str
+    piece_ids: list[int]
+    order_status: str
+    replayed: bool = False
+

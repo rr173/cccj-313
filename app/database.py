@@ -117,15 +117,114 @@ CREATE TABLE IF NOT EXISTS quarantine (
     opened_at      TEXT NOT NULL,
     closed_at      TEXT
 );
+
+-- ------------------------------------------------------------------ 工位交接
+-- 工位缓冲位固定容量；一件占一位。ACTUAL 表示实物在位，RESERVED 表示已预留
+-- 但尚无实物（待发收件位 / 发运后的退回保留位）。两者都占用容量。
+
+CREATE TABLE IF NOT EXISTS workstation (
+    workstation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    code           TEXT NOT NULL UNIQUE,
+    name           TEXT NOT NULL,
+    capacity       INTEGER NOT NULL CHECK (capacity >= 0),
+    created_at     TEXT NOT NULL
+);
+
+-- 一件实物对应一个已建工件编号；关口工序必须属于该工件。
+-- 不复制任何检验 / 完工凭据，关口有效性始终实时读取原工序状态。
+CREATE TABLE IF NOT EXISTS piece (
+    piece_id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    workpiece_id          INTEGER NOT NULL UNIQUE REFERENCES workpiece(workpiece_id),
+    gate_process_id       INTEGER NOT NULL REFERENCES process(process_id),
+    status                TEXT NOT NULL CHECK (status IN ('AT_WORKSTATION', 'IN_TRANSIT')),
+    current_workstation_id INTEGER NOT NULL REFERENCES workstation(workstation_id),
+    created_at            TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS transfer_order (
+    order_id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_workstation_id INTEGER NOT NULL REFERENCES workstation(workstation_id),
+    dest_workstation_id   INTEGER NOT NULL REFERENCES workstation(workstation_id),
+    status                TEXT NOT NULL CHECK (
+                              status IN ('PENDING', 'SHIPPED', 'COMPLETED', 'CANCELLED')),
+    created_at            TEXT NOT NULL,
+    shipped_at            TEXT,
+    closed_at             TEXT,
+    CHECK (source_workstation_id <> dest_workstation_id)
+);
+
+-- 单内每件的独立状态；released_at 非空表示该件已落地（签收 / 退回）或被撤销，
+-- 不再被本单占用。部分唯一索引保证一件同时最多在一张待发 / 在途单上。
+CREATE TABLE IF NOT EXISTS transfer_order_piece (
+    order_id    INTEGER NOT NULL REFERENCES transfer_order(order_id),
+    piece_id    INTEGER NOT NULL REFERENCES piece(piece_id),
+    state       TEXT NOT NULL CHECK (
+                    state IN ('PENDING', 'IN_TRANSIT', 'RECEIVED', 'RETURNED', 'CANCELLED')),
+    released_at TEXT,
+    PRIMARY KEY (order_id, piece_id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_active_piece_order
+    ON transfer_order_piece(piece_id) WHERE released_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS workstation_slot (
+    slot_id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    workstation_id INTEGER NOT NULL REFERENCES workstation(workstation_id),
+    piece_id       INTEGER NOT NULL REFERENCES piece(piece_id),
+    state          TEXT NOT NULL CHECK (state IN ('ACTUAL', 'RESERVED')),
+    purpose        TEXT NOT NULL CHECK (purpose IN ('HOME', 'RECEIPT', 'RETURN')),
+    order_id       INTEGER REFERENCES transfer_order(order_id),
+    created_at     TEXT NOT NULL,
+    UNIQUE (workstation_id, piece_id, purpose)
+);
+CREATE INDEX IF NOT EXISTS idx_slot_workstation ON workstation_slot(workstation_id);
+
+-- 容量兜底：即使应用层校验遗漏，也决不超占。ACTUAL 与 RESERVED 均计数。
+CREATE TRIGGER IF NOT EXISTS trg_workstation_slot_capacity
+BEFORE INSERT ON workstation_slot
+BEGIN
+    SELECT RAISE(ABORT, 'workstation_capacity_exceeded')
+    WHERE (SELECT COUNT(*) FROM workstation_slot WHERE workstation_id = NEW.workstation_id)
+          >= (SELECT capacity FROM workstation WHERE workstation_id = NEW.workstation_id);
+END;
+
+-- 发运 / 签收 / 退回的请求号幂等记录，按调拨单隔离。失败请求不写此表。
+CREATE TABLE IF NOT EXISTS transfer_action (
+    action_id   INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id    INTEGER NOT NULL REFERENCES transfer_order(order_id),
+    request_id  TEXT NOT NULL,
+    action      TEXT NOT NULL CHECK (action IN ('SHIP', 'RECEIVE', 'RETURN')),
+    operator    TEXT NOT NULL,
+    piece_key   TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    UNIQUE (order_id, request_id)
+);
+
+-- 每件落地留痕，用于查询“谁签收 / 退回了哪些件”。只增不改。
+CREATE TABLE IF NOT EXISTS transfer_record (
+    record_id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id             INTEGER NOT NULL REFERENCES transfer_order(order_id),
+    action_id            INTEGER NOT NULL REFERENCES transfer_action(action_id),
+    piece_id             INTEGER NOT NULL REFERENCES piece(piece_id),
+    action               TEXT NOT NULL CHECK (action IN ('RECEIVE', 'RETURN')),
+    operator             TEXT NOT NULL,
+    request_id           TEXT NOT NULL,
+    from_workstation_id  INTEGER NOT NULL,
+    to_workstation_id    INTEGER NOT NULL,
+    created_at           TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_transfer_record_order ON transfer_record(order_id);
 """
 
 
 def get_connection(db_path: Path | str | None = None) -> sqlite3.Connection:
     path = str(db_path if db_path is not None else DB_PATH)
-    conn = sqlite3.connect(path, timeout=30)
+    # isolation_level=None：事务边界由服务层显式 BEGIN IMMEDIATE / COMMIT 控制，
+    # 使多个进程（两个终端）共用同一个 SQLite 库时写操作真正串行化。
+    conn = sqlite3.connect(path, timeout=30, isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
-    # WAL 让读不阻塞写；写仍由应用层全局锁串行化
+    # WAL 让读不阻塞写；写事务由 BEGIN IMMEDIATE + busy_timeout 串行化
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA busy_timeout = 30000")
     return conn

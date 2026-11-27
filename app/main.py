@@ -192,3 +192,113 @@ def process_quarantines(process_id: int) -> list[dict]:
 @app.get("/api/quarantines", response_model=list[schemas.QuarantineOut], tags=["工序动作"])
 def all_quarantines(open_only: bool = False) -> list[dict]:
     return services.list_quarantines(DB_PATH, open_only=open_only)
+
+
+# --------------------------------------------------------------- 工位交接
+
+@app.post("/api/workstations", response_model=schemas.WorkstationOut, status_code=201, tags=["工位交接"])
+def create_workstation(payload: schemas.WorkstationCreate) -> dict:
+    return services.create_workstation(DB_PATH, payload.code, payload.name, payload.capacity)
+
+
+@app.get("/api/workstations", response_model=list[schemas.WorkstationOut], tags=["工位交接"])
+def list_workstations() -> list[dict]:
+    return services.list_workstations(DB_PATH)
+
+
+@app.get(
+    "/api/workstations/{workstation_id}",
+    response_model=schemas.WorkstationDetailOut,
+    tags=["工位交接"],
+)
+def get_workstation(workstation_id: int) -> dict:
+    """两个工位还剩多少位置，并区分实际在位与已预留无实物。"""
+    return services.get_workstation(DB_PATH, workstation_id)
+
+
+@app.post("/api/pieces", response_model=schemas.PieceOut, status_code=201, tags=["工位交接"])
+def create_piece(payload: schemas.PieceCreate) -> dict:
+    return services.create_piece(
+        DB_PATH, payload.workpiece_id, payload.gate_process_id, payload.workstation_id
+    )
+
+
+@app.get("/api/pieces", response_model=list[schemas.PieceOut], tags=["工位交接"])
+def list_pieces() -> list[dict]:
+    return services.list_pieces(DB_PATH)
+
+
+@app.get("/api/pieces/{piece_id}", response_model=schemas.PieceOut, tags=["工位交接"])
+def get_piece(piece_id: int) -> dict:
+    """每件实物现在在哪、是否被质量冻结。"""
+    return services.get_piece(DB_PATH, piece_id)
+
+
+@app.post(
+    "/api/transfer-orders",
+    response_model=schemas.TransferOrderOut,
+    status_code=201,
+    tags=["工位交接"],
+)
+def create_transfer_order(payload: schemas.TransferOrderCreate) -> dict:
+    return services.create_transfer_order(
+        DB_PATH, payload.source_workstation_id, payload.dest_workstation_id, payload.piece_ids
+    )
+
+
+@app.get("/api/transfer-orders", response_model=list[schemas.TransferOrderOut], tags=["工位交接"])
+def list_transfer_orders() -> list[dict]:
+    return services.list_transfer_orders(DB_PATH)
+
+
+@app.get(
+    "/api/transfer-orders/{order_id}",
+    response_model=schemas.TransferOrderDetailOut,
+    tags=["工位交接"],
+)
+def get_transfer_order(order_id: int) -> dict:
+    """单详情：每件状态 + 谁签收 / 退回了哪些件。"""
+    return services.get_transfer_order(DB_PATH, order_id)
+
+
+@app.post(
+    "/api/transfer-orders/{order_id}/cancel",
+    response_model=schemas.TransferOrderOut,
+    tags=["工位交接"],
+)
+def cancel_transfer_order(order_id: int) -> dict:
+    return services.cancel_transfer_order(DB_PATH, order_id)
+
+
+@app.post(
+    "/api/transfer-orders/{order_id}/ship",
+    response_model=schemas.TransferActionResult,
+    tags=["工位交接"],
+)
+def ship_transfer_order(order_id: int, payload: schemas.TransferRequest) -> dict:
+    return services.ship_transfer_order(
+        DB_PATH, order_id, payload.operator, payload.request_id
+    )
+
+
+@app.post(
+    "/api/transfer-orders/{order_id}/receive",
+    response_model=schemas.TransferActionResult,
+    tags=["工位交接"],
+)
+def receive_transfer_order(order_id: int, payload: schemas.TransferBatchRequest) -> dict:
+    return services.receive_transfer_order(
+        DB_PATH, order_id, payload.piece_ids, payload.operator, payload.request_id
+    )
+
+
+@app.post(
+    "/api/transfer-orders/{order_id}/return",
+    response_model=schemas.TransferActionResult,
+    tags=["工位交接"],
+)
+def return_transfer_order(order_id: int, payload: schemas.TransferBatchRequest) -> dict:
+    return services.return_transfer_order(
+        DB_PATH, order_id, payload.piece_ids, payload.operator, payload.request_id
+    )
+

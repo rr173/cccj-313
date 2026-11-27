@@ -14,12 +14,14 @@
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 from collections import deque
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 
 from .database import get_connection, init_db
 
@@ -31,6 +33,24 @@ class ServiceError(Exception):
         self.status_code = status_code
         self.detail = detail
         super().__init__(detail)
+
+
+@contextmanager
+def _immediate_tx(conn: sqlite3.Connection) -> Iterator[None]:
+    """显式 BEGIN IMMEDIATE 事务：立即取得 SQLite 写锁，跨进程串行化写操作。
+
+    连接使用 isolation_level=None，因此事务边界完全由这里控制。
+    业务校验全部在写锁内完成，两个终端并发的重复发运 / 落地 / 容量占用
+    都会被串行化，后到者看到前者已提交的状态并据此拒绝。
+    """
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        yield
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
+    else:
+        conn.execute("COMMIT")
 
 
 # ---------------------------------------------------------------- time helpers
@@ -279,7 +299,7 @@ def create_gauge(db_path: Path | str | None, code: str, name: str) -> dict[str, 
     with _service_lock:
         conn = get_connection(db_path)
         try:
-            with conn:
+            with _immediate_tx(conn):
                 try:
                     cur = conn.execute(
                         "INSERT INTO gauge(code, name, created_at) VALUES (?, ?, ?)",
@@ -323,7 +343,7 @@ def register_gauge_window(
             ).fetchone()
             if gauge is None:
                 raise ServiceError(404, f"量具 {gauge_id} 不存在")
-            with conn:
+            with _immediate_tx(conn):
                 cur = conn.execute(
                     """
                     INSERT INTO gauge_window(gauge_id, window_start, window_end, note, created_at)
@@ -434,7 +454,7 @@ def create_workpiece(db_path: Path | str | None, payload: dict[str, Any]) -> dic
     with _service_lock:
         conn = get_connection(db_path)
         try:
-            with conn:
+            with _immediate_tx(conn):
                 try:
                     cur = conn.execute(
                         "INSERT INTO workpiece(code, created_at) VALUES (?, ?)",
@@ -529,7 +549,7 @@ def register_inspection(
             ).fetchone() is None:
                 raise ServiceError(404, f"量具 {gauge_id} 不存在")
 
-            with conn:
+            with _immediate_tx(conn):
                 cur = conn.execute(
                     """
                     INSERT INTO inspection(item_id, gauge_id, reading, measured_at, accepted_at)
@@ -611,7 +631,7 @@ def start_process(
             if issues:
                 raise ServiceError(409, "不满足开工条件：" + "；".join(issues))
 
-            with conn:
+            with _immediate_tx(conn):
                 credential_id = _insert_credential(conn, process_id, "START", operator)
                 conn.execute(
                     "UPDATE process_state SET status = 'STARTED', quarantined_at = NULL, reason = NULL"
@@ -647,7 +667,7 @@ def complete_process(
                 raise ServiceError(409, "放行依据已失效，不能完工：" + "；".join(issues))
 
             active = _active_credential(conn, process_id)
-            with conn:
+            with _immediate_tx(conn):
                 credential_id = _insert_credential(
                     conn, process_id, "COMPLETE", operator, basis_id=active["credential_id"]
                 )
@@ -696,7 +716,7 @@ def review_process(
                 raise ServiceError(409, "未找到未关闭的隔离单")
             restored = open_q["pre_status"]
 
-            with conn:
+            with _immediate_tx(conn):
                 credential_id = _insert_credential(conn, process_id, "REVIEW", operator)
                 conn.execute(
                     "UPDATE quarantine SET closed_at = ? WHERE quarantine_id = ?",
@@ -833,3 +853,817 @@ def list_workpiece_statuses(db_path: Path | str | None, workpiece_id: int) -> li
 
 def ensure_db(db_path: Path | str | None = None) -> None:
     init_db(db_path)
+
+
+# =============================================================== 工位交接
+#
+# 容量账本（每种工位）：
+#   ACTUAL   实物在位（HOME 件 / 已签收或已退回落地的件）——占位
+#   RESERVED 尚无实物的预留（待发收件位 / 发运后发件方的退回保留位）——占位
+# 两种状态合计不得超过工位容量。签收 / 退回都是「释放一侧预留、占用另一侧
+# 已预留的位置」，总占用不变，落地的一方由 RESERVED 转为 ACTUAL。
+#
+# 件状态：
+#   AT_WORKSTATION  实物在 current_workstation_id
+#   IN_TRANSIT      发运后实物在途中
+# 调拨单件状态：
+#   PENDING -> IN_TRANSIT -> RECEIVED / RETURNED；PENDING 可 CANCELLED。
+#   某件的 released_at 一旦非空，该件不再受本单占用（可进入后续单据）。
+
+
+def _get_workstation(conn: sqlite3.Connection, workstation_id: int) -> sqlite3.Row:
+    row = conn.execute(
+        "SELECT * FROM workstation WHERE workstation_id = ?", (workstation_id,)
+    ).fetchone()
+    if row is None:
+        raise ServiceError(404, f"工位 {workstation_id} 不存在")
+    return row
+
+
+def _slot_counts(conn: sqlite3.Connection, workstation_id: int) -> tuple[int, int]:
+    actual, reserved = conn.execute(
+        """
+        SELECT
+          COALESCE(SUM(CASE WHEN state = 'ACTUAL' THEN 1 ELSE 0 END), 0),
+          COALESCE(SUM(CASE WHEN state = 'RESERVED' THEN 1 ELSE 0 END), 0)
+        FROM workstation_slot WHERE workstation_id = ?
+        """,
+        (workstation_id,),
+    ).fetchone()
+    return int(actual), int(reserved)
+
+
+def _available_slots(conn: sqlite3.Connection, workstation_id: int) -> int:
+    ws = _get_workstation(conn, workstation_id)
+    actual, reserved = _slot_counts(conn, workstation_id)
+    return int(ws["capacity"]) - actual - reserved
+
+
+def _insert_slot(
+    conn: sqlite3.Connection,
+    workstation_id: int,
+    piece_id: int,
+    state: str,
+    purpose: str,
+    order_id: Optional[int] = None,
+) -> None:
+    """插入一个占位。容量由应用层预检 + 数据库触发器双重保证。"""
+    if _available_slots(conn, workstation_id) <= 0:
+        ws = _get_workstation(conn, workstation_id)
+        raise ServiceError(
+            409,
+            f"工位 {ws['code']}（id={workstation_id}）缓冲位已满："
+            f"容量 {ws['capacity']}，实际在位与已预留合计已占满",
+        )
+    try:
+        conn.execute(
+            """
+            INSERT INTO workstation_slot(workstation_id, piece_id, state, purpose, order_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (workstation_id, piece_id, state, purpose, order_id, now_iso()),
+        )
+    except sqlite3.IntegrityError as exc:
+        # 触发器兜底（理论上预检已拦住；并发下由 BEGIN IMMEDIATE 串行化）
+        if "workstation_capacity_exceeded" in str(exc):
+            raise ServiceError(409, f"工位 {workstation_id} 缓冲位已满（容量约束）") from exc
+        raise
+
+
+def _slot_exists(
+    conn: sqlite3.Connection, workstation_id: int, piece_id: int, purpose: str
+) -> bool:
+    return (
+        conn.execute(
+            "SELECT 1 FROM workstation_slot WHERE workstation_id = ? AND piece_id = ? AND purpose = ?",
+            (workstation_id, piece_id, purpose),
+        ).fetchone()
+        is not None
+    )
+
+
+def _order_row(conn: sqlite3.Connection, order_id: int) -> sqlite3.Row:
+    row = conn.execute(
+        "SELECT * FROM transfer_order WHERE order_id = ?", (order_id,)
+    ).fetchone()
+    if row is None:
+        raise ServiceError(404, f"调拨单 {order_id} 不存在")
+    return row
+
+
+def _piece_row(conn: sqlite3.Connection, piece_id: int) -> sqlite3.Row:
+    row = conn.execute("SELECT * FROM piece WHERE piece_id = ?", (piece_id,)).fetchone()
+    if row is None:
+        raise ServiceError(404, f"件 {piece_id} 不存在")
+    return row
+
+
+def _gate_valid(conn: sqlite3.Connection, piece: sqlite3.Row) -> tuple[bool, list[str]]:
+    """关口是否按现有工序规则有效完工。只读实时状态，不复制任何记录。"""
+    gate_id = piece["gate_process_id"]
+    state = _get_state(conn, gate_id)
+    if state["status"] != "COMPLETED":
+        label = {
+            "NOT_STARTED": "尚未开工",
+            "STARTED": "尚未完工",
+            "QUARANTINED": "已隔离（失效完工状态）",
+        }.get(state["status"], state["status"])
+        return False, [f"关口工序当前状态为 {state['status']}（{label}）"]
+    issues = _basis_issues(conn, gate_id)
+    return (not issues), issues
+
+
+def _quality_frozen(conn: sqlite3.Connection, piece: sqlite3.Row) -> bool:
+    """物料（工件）关口当前是否不再有效完工 —— 当前库存即被质量冻结。"""
+    valid, _ = _gate_valid(conn, piece)
+    return not valid
+
+
+def _active_order_for_piece(conn: sqlite3.Connection, piece_id: int) -> Optional[int]:
+    row = conn.execute(
+        """
+        SELECT order_id FROM transfer_order_piece
+        WHERE piece_id = ? AND released_at IS NULL
+        """,
+        (piece_id,),
+    ).fetchone()
+    return row["order_id"] if row is not None else None
+
+
+def _piece_dict(conn: sqlite3.Connection, piece: sqlite3.Row) -> dict[str, Any]:
+    wp = conn.execute(
+        "SELECT code FROM workpiece WHERE workpiece_id = ?", (piece["workpiece_id"],)
+    ).fetchone()
+    gate = conn.execute(
+        "SELECT code FROM process WHERE process_id = ?", (piece["gate_process_id"],)
+    ).fetchone()
+    ws = conn.execute(
+        "SELECT code FROM workstation WHERE workstation_id = ?",
+        (piece["current_workstation_id"],),
+    ).fetchone()
+    valid, _ = _gate_valid(conn, piece)
+    return {
+        "piece_id": piece["piece_id"],
+        "workpiece_id": piece["workpiece_id"],
+        "workpiece_code": wp["code"],
+        "gate_process_id": piece["gate_process_id"],
+        "gate_process_code": gate["code"],
+        "status": piece["status"],
+        "current_workstation_id": piece["current_workstation_id"],
+        "current_workstation_code": ws["code"],
+        "gate_valid": valid,
+        "quality_frozen": not valid,
+        "active_order_id": _active_order_for_piece(conn, piece["piece_id"]),
+        "created_at": piece["created_at"],
+    }
+
+
+# ------------------------------------------------------------------ workstations
+
+def create_workstation(
+    db_path: Path | str | None, code: str, name: str, capacity: int
+) -> dict[str, Any]:
+    if capacity < 0:
+        raise ServiceError(422, "缓冲位容量不能为负")
+    with _service_lock:
+        conn = get_connection(db_path)
+        try:
+            with _immediate_tx(conn):
+                try:
+                    cur = conn.execute(
+                        "INSERT INTO workstation(code, name, capacity, created_at) VALUES (?, ?, ?, ?)",
+                        (code, name, capacity, now_iso()),
+                    )
+                except sqlite3.IntegrityError as exc:
+                    raise ServiceError(409, f"工位编号 {code} 已存在") from exc
+                workstation_id = cur.lastrowid
+            row = conn.execute(
+                "SELECT * FROM workstation WHERE workstation_id = ?", (workstation_id,)
+            ).fetchone()
+            return dict(row)
+        finally:
+            conn.close()
+
+
+def list_workstations(db_path: Path | str | None) -> list[dict[str, Any]]:
+    conn = get_connection(db_path)
+    try:
+        return [dict(r) for r in conn.execute("SELECT * FROM workstation ORDER BY workstation_id")]
+    finally:
+        conn.close()
+
+
+def get_workstation(db_path: Path | str | None, workstation_id: int) -> dict[str, Any]:
+    conn = get_connection(db_path)
+    try:
+        ws = _get_workstation(conn, workstation_id)
+        actual, reserved = _slot_counts(conn, workstation_id)
+        slots = [
+            dict(r)
+            for r in conn.execute(
+                "SELECT * FROM workstation_slot WHERE workstation_id = ? ORDER BY slot_id",
+                (workstation_id,),
+            )
+        ]
+        result = dict(ws)
+        result.update(
+            {
+                "actual_count": actual,
+                "reserved_count": reserved,
+                "available": int(ws["capacity"]) - actual - reserved,
+                "actual_pieces": [s["piece_id"] for s in slots if s["state"] == "ACTUAL"],
+                "reserved_pieces": [s["piece_id"] for s in slots if s["state"] == "RESERVED"],
+                "slots": slots,
+            }
+        )
+        return result
+    finally:
+        conn.close()
+
+
+# ------------------------------------------------------------------------ pieces
+
+def create_piece(
+    db_path: Path | str | None,
+    workpiece_id: int,
+    gate_process_id: int,
+    workstation_id: int,
+) -> dict[str, Any]:
+    """用已有工件编号登记实物：初始工位占一个 ACTUAL 位。
+
+    关口工序必须属于该工件；成品关口工序即真实完工关口，不复制检验 / 完工记录。
+    """
+    with _service_lock:
+        conn = get_connection(db_path)
+        try:
+            with _immediate_tx(conn):
+                if conn.execute(
+                    "SELECT 1 FROM workpiece WHERE workpiece_id = ?", (workpiece_id,)
+                ).fetchone() is None:
+                    raise ServiceError(404, f"工件 {workpiece_id} 不存在")
+                gate = conn.execute(
+                    "SELECT * FROM process WHERE process_id = ?", (gate_process_id,)
+                ).fetchone()
+                if gate is None:
+                    raise ServiceError(404, f"关口工序 {gate_process_id} 不存在")
+                if gate["workpiece_id"] != workpiece_id:
+                    raise ServiceError(422, "关口工序必须属于该工件")
+                _get_workstation(conn, workstation_id)
+
+                if conn.execute(
+                    "SELECT 1 FROM piece WHERE workpiece_id = ?", (workpiece_id,)
+                ).fetchone() is not None:
+                    raise ServiceError(409, f"工件 {workpiece_id} 已登记为实物件，不能重复登记")
+
+                cur = conn.execute(
+                    """
+                    INSERT INTO piece(workpiece_id, gate_process_id, status, current_workstation_id, created_at)
+                    VALUES (?, ?, 'AT_WORKSTATION', ?, ?)
+                    """,
+                    (workpiece_id, gate_process_id, workstation_id, now_iso()),
+                )
+                piece_id = cur.lastrowid
+                _insert_slot(conn, workstation_id, piece_id, "ACTUAL", "HOME")
+            row = conn.execute("SELECT * FROM piece WHERE piece_id = ?", (piece_id,)).fetchone()
+            return _piece_dict(conn, row)
+        finally:
+            conn.close()
+
+
+def get_piece(db_path: Path | str | None, piece_id: int) -> dict[str, Any]:
+    conn = get_connection(db_path)
+    try:
+        return _piece_dict(conn, _piece_row(conn, piece_id))
+    finally:
+        conn.close()
+
+
+def list_pieces(db_path: Path | str | None) -> list[dict[str, Any]]:
+    conn = get_connection(db_path)
+    try:
+        return [
+            _piece_dict(conn, r)
+            for r in conn.execute("SELECT * FROM piece ORDER BY piece_id")
+        ]
+    finally:
+        conn.close()
+
+
+# ------------------------------------------------------------------ transfer orders
+
+def _order_pieces(conn: sqlite3.Connection, order_id: int) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT op.*, p.workpiece_id FROM transfer_order_piece op
+        JOIN piece p ON p.piece_id = op.piece_id
+        WHERE op.order_id = ? ORDER BY op.piece_id
+        """,
+        (order_id,),
+    ).fetchall()
+    result = []
+    for r in rows:
+        wp = conn.execute(
+            "SELECT code FROM workpiece WHERE workpiece_id = ?", (r["workpiece_id"],)
+        ).fetchone()
+        result.append(
+            {
+                "piece_id": r["piece_id"],
+                "workpiece_code": wp["code"],
+                "state": r["state"],
+                "released_at": r["released_at"],
+            }
+        )
+    return result
+
+
+def _order_dict(conn: sqlite3.Connection, order: sqlite3.Row) -> dict[str, Any]:
+    result = dict(order)
+    result["pieces"] = _order_pieces(conn, order["order_id"])
+    return result
+
+
+def _order_records(conn: sqlite3.Connection, order_id: int) -> list[dict[str, Any]]:
+    return [
+        dict(r)
+        for r in conn.execute(
+            "SELECT * FROM transfer_record WHERE order_id = ? ORDER BY record_id", (order_id,)
+        )
+    ]
+
+
+def _order_actions(conn: sqlite3.Connection, order_id: int) -> list[dict[str, Any]]:
+    """发运 / 签收 / 退回的操作留痕（含请求号），只增不改。"""
+    result = []
+    for r in conn.execute(
+        "SELECT * FROM transfer_action WHERE order_id = ? ORDER BY action_id", (order_id,)
+    ):
+        try:
+            piece_ids = json.loads(r["piece_key"])
+        except (TypeError, ValueError):  # pragma: no cover - 写入时始终是 JSON
+            piece_ids = []
+        result.append(
+            {
+                "action_id": r["action_id"],
+                "order_id": r["order_id"],
+                "request_id": r["request_id"],
+                "action": r["action"],
+                "operator": r["operator"],
+                "piece_ids": piece_ids,
+                "created_at": r["created_at"],
+            }
+        )
+    return result
+
+
+def create_transfer_order(
+    db_path: Path | str | None,
+    source_workstation_id: int,
+    dest_workstation_id: int,
+    piece_ids: list[int],
+) -> dict[str, Any]:
+    """建单：校验发 / 收工位不同、件当前在发件方且未被其它单占用，
+    并为每件在收件方预留一个位置。只预留，不移动实物。
+
+    关口是否有效完工属于**发运时**的整单条件，建单不因此拒绝——待发单可以
+    先建好并留位，等关口完工后再发运。
+    """
+    if not piece_ids:
+        raise ServiceError(422, "调拨单至少包含一个件")
+    if len(piece_ids) != len(set(piece_ids)):
+        raise ServiceError(422, "调拨单内件不能重复")
+    if source_workstation_id == dest_workstation_id:
+        raise ServiceError(422, "发件工位与收件工位必须不同")
+
+    with _service_lock:
+        conn = get_connection(db_path)
+        try:
+            with _immediate_tx(conn):
+                src = _get_workstation(conn, source_workstation_id)
+                dst = _get_workstation(conn, dest_workstation_id)
+
+                # ---- 先完整校验，任何一件不合格整单不建（不产生部分预留）----
+                failures: list[str] = []
+                pieces: list[sqlite3.Row] = []
+                for piece_id in piece_ids:
+                    try:
+                        piece = _piece_row(conn, piece_id)
+                    except ServiceError as exc:
+                        failures.append(f"件 {piece_id}：{exc.detail}")
+                        continue
+                    pieces.append(piece)
+                    if piece["status"] != "AT_WORKSTATION":
+                        failures.append(f"件 {piece_id} 在途中，不能上单")
+                        continue
+                    if piece["current_workstation_id"] != source_workstation_id:
+                        failures.append(f"件 {piece_id} 不在发件工位 {src['code']}")
+                    active = _active_order_for_piece(conn, piece_id)
+                    if active is not None:
+                        failures.append(f"件 {piece_id} 已在调拨单 {active} 上待发或在途")
+                if failures:
+                    raise ServiceError(409, "整单不能创建：" + "；".join(failures))
+
+                # 收件方需为每件预留一个位置（容量校验按整批一次判断）
+                if _available_slots(conn, dest_workstation_id) < len(pieces):
+                    raise ServiceError(
+                        409,
+                        f"收件工位 {dst['code']} 可用缓冲位不足：需要 {len(pieces)}，"
+                        f"剩余 {_available_slots(conn, dest_workstation_id)}",
+                    )
+                # 发件方每件仍占一个 ACTUAL 位，建单不动它
+
+                cur = conn.execute(
+                    """
+                    INSERT INTO transfer_order(source_workstation_id, dest_workstation_id, status, created_at)
+                    VALUES (?, ?, 'PENDING', ?)
+                    """,
+                    (source_workstation_id, dest_workstation_id, now_iso()),
+                )
+                order_id = cur.lastrowid
+                for piece in pieces:
+                    conn.execute(
+                        """
+                        INSERT INTO transfer_order_piece(order_id, piece_id, state)
+                        VALUES (?, ?, 'PENDING')
+                        """,
+                        (order_id, piece["piece_id"]),
+                    )
+                    _insert_slot(
+                        conn, dest_workstation_id, piece["piece_id"], "RESERVED", "RECEIPT", order_id
+                    )
+            order = _order_row(conn, order_id)
+            return _order_dict(conn, order)
+        finally:
+            conn.close()
+
+
+def get_transfer_order(db_path: Path | str | None, order_id: int) -> dict[str, Any]:
+    conn = get_connection(db_path)
+    try:
+        order = _order_row(conn, order_id)
+        result = _order_dict(conn, order)
+        result["actions"] = _order_actions(conn, order_id)
+        result["records"] = _order_records(conn, order_id)
+        return result
+    finally:
+        conn.close()
+
+
+def list_transfer_orders(db_path: Path | str | None) -> list[dict[str, Any]]:
+    conn = get_connection(db_path)
+    try:
+        return [
+            _order_dict(conn, r)
+            for r in conn.execute("SELECT * FROM transfer_order ORDER BY order_id")
+        ]
+    finally:
+        conn.close()
+
+
+def cancel_transfer_order(db_path: Path | str | None, order_id: int) -> dict[str, Any]:
+    """撤销待发单：释放收件方预留位，件留在发件方原位。已发运的单不能撤销。"""
+    with _service_lock:
+        conn = get_connection(db_path)
+        try:
+            with _immediate_tx(conn):
+                order = _order_row(conn, order_id)
+                if order["status"] != "PENDING":
+                    raise ServiceError(409, f"调拨单状态为 {order['status']}，只有待发单可以撤销")
+                now = now_iso()
+                conn.execute(
+                    "DELETE FROM workstation_slot WHERE order_id = ? AND purpose = 'RECEIPT'",
+                    (order_id,),
+                )
+                conn.execute(
+                    "UPDATE transfer_order_piece SET state = 'CANCELLED', released_at = ?"
+                    " WHERE order_id = ? AND released_at IS NULL",
+                    (now, order_id),
+                )
+                conn.execute(
+                    "UPDATE transfer_order SET status = 'CANCELLED', closed_at = ? WHERE order_id = ?",
+                    (now, order_id),
+                )
+            order = _order_row(conn, order_id)
+            return _order_dict(conn, order)
+        finally:
+            conn.close()
+
+
+# ------------------------------------------------------------- idempotent actions
+
+def _piece_key_for_requests(conn: sqlite3.Connection, order_id: int, piece_ids: list[int]) -> str:
+    """幂等键的比较口径：件集合排序后的列表（同号不同批次的件视为换内容）。"""
+    return json.dumps(sorted(set(piece_ids)), separators=(",", ":"))
+
+
+def _existing_action(
+    conn: sqlite3.Connection, order_id: int, request_id: str, action: str
+) -> Optional[sqlite3.Row]:
+    """返回同号请求；同号换内容（动作 / 操作者 / 件批次不同）则 409，失败不占号。"""
+    row = conn.execute(
+        "SELECT * FROM transfer_action WHERE order_id = ? AND request_id = ?",
+        (order_id, request_id),
+    ).fetchone()
+    return row
+
+
+def _replay_or_conflict(
+    existing: sqlite3.Row,
+    action: str,
+    operator: str,
+    piece_key: str,
+) -> dict[str, Any]:
+    same = (
+        existing["action"] == action
+        and existing["operator"] == operator
+        and existing["piece_key"] == piece_key
+    )
+    if not same:
+        raise ServiceError(
+            409,
+            f"请求号 {existing['request_id']} 已被不同的请求内容使用，拒绝执行",
+        )
+    result = json.loads(existing["result_json"])
+    result["replayed"] = True
+    return result
+
+
+def _empty_piece_key() -> str:
+    return json.dumps([], separators=(",", ":"))
+
+
+def ship_transfer_order(
+    db_path: Path | str | None,
+    order_id: int,
+    operator: str,
+    request_id: str,
+) -> dict[str, Any]:
+    """发运整单：所有件关口仍须有效完工；发件方为每件保留退回位置。
+
+    幂等键包含整单的件集合；同号重发返回首次结果。
+    """
+    with _service_lock:
+        conn = get_connection(db_path)
+        try:
+            with _immediate_tx(conn):
+                order = _order_row(conn, order_id)
+                rows = conn.execute(
+                    "SELECT * FROM transfer_order_piece WHERE order_id = ? ORDER BY piece_id",
+                    (order_id,),
+                ).fetchall()
+                all_piece_ids = [r["piece_id"] for r in rows]
+                piece_key = _piece_key_for_requests(conn, order_id, all_piece_ids)
+
+                existing = _existing_action(conn, order_id, request_id, "SHIP")
+                if existing is not None:
+                    return _replay_or_conflict(existing, "SHIP", operator, piece_key)
+
+                # 校验放在写锁内：同号首次请求与其它写操作串行
+                if order["status"] == "CANCELLED":
+                    raise ServiceError(409, "调拨单已撤销，不能发运")
+                if order["status"] != "PENDING":
+                    raise ServiceError(409, f"调拨单状态为 {order['status']}，不是待发单")
+                pending = [r for r in rows if r["state"] == "PENDING" and r["released_at"] is None]
+                if len(pending) != len(rows) or not pending:
+                    raise ServiceError(409, "调拨单存在已落地 / 释放的件，不能整单发运")
+
+                # 关口有效性在发运瞬间实时校验（隔离 / 失效会立即拦截，不用旧快照）
+                failures: list[str] = []
+                for r in pending:
+                    piece = _piece_row(conn, r["piece_id"])
+                    valid, issues = _gate_valid(conn, piece)
+                    if not valid:
+                        failures.append(
+                            f"件 {piece['piece_id']} 关口未有效完工：" + "；".join(issues)
+                        )
+                if failures:
+                    # 整单仍待发，不占用请求号
+                    raise ServiceError(409, "存在关口未有效完工的件，整单仍待发：" + "；".join(failures))
+
+                src_id = order["source_workstation_id"]
+                # 发件方须为每件保留退回位置（发运后这些位置只接纳退回件）。
+                # 计入本单各件当前占用的 HOME 位：发运时它们会被就地转为退回预留，
+                # 因此只需保证扣除这些 HOME 位后的空余位置足够。
+                pending_ids = [r["piece_id"] for r in pending]
+                placeholders = ",".join("?" for _ in pending_ids)
+                home_slots = conn.execute(
+                    f"SELECT COUNT(*) FROM workstation_slot WHERE workstation_id = ?"
+                    f" AND state = 'ACTUAL' AND piece_id IN ({placeholders})",
+                    (src_id, *pending_ids),
+                ).fetchone()[0]
+                if _available_slots(conn, src_id) + home_slots < len(pending):
+                    src = _get_workstation(conn, src_id)
+                    raise ServiceError(
+                        409,
+                        f"发件工位 {src['code']} 无法为每件保留退回位置：需要 {len(pending)}，"
+                        f"扣除本单实物占位后仅剩 "
+                        f"{_available_slots(conn, src_id) + home_slots}",
+                    )
+
+                now = now_iso()
+                for r in pending:
+                    piece = _piece_row(conn, r["piece_id"])
+                    # 释放发件方的在库占位，改预留为退回保留位
+                    conn.execute(
+                        "DELETE FROM workstation_slot WHERE workstation_id = ? AND piece_id = ?"
+                        " AND state = 'ACTUAL'",
+                        (src_id, piece["piece_id"]),
+                    )
+                    _insert_slot(conn, src_id, piece["piece_id"], "RESERVED", "RETURN", order_id)
+                    conn.execute(
+                        "UPDATE piece SET status = 'IN_TRANSIT' WHERE piece_id = ?",
+                        (piece["piece_id"],),
+                    )
+                    conn.execute(
+                        "UPDATE transfer_order_piece SET state = 'IN_TRANSIT' WHERE order_id = ?"
+                        " AND piece_id = ?",
+                        (order_id, piece["piece_id"]),
+                    )
+                conn.execute(
+                    "UPDATE transfer_order SET status = 'SHIPPED', shipped_at = ? WHERE order_id = ?",
+                    (now, order_id),
+                )
+
+                result = {
+                    "order_id": order_id,
+                    "action": "SHIP",
+                    "request_id": request_id,
+                    "operator": operator,
+                    "piece_ids": all_piece_ids,
+                    "order_status": "SHIPPED",
+                    "replayed": False,
+                }
+                conn.execute(
+                    """
+                    INSERT INTO transfer_action(order_id, request_id, action, operator, piece_key, result_json, created_at)
+                    VALUES (?, ?, 'SHIP', ?, ?, ?, ?)
+                    """,
+                    (order_id, request_id, operator, piece_key, json.dumps(result), now),
+                )
+            return result
+        finally:
+            conn.close()
+
+
+def _land_pieces(
+    conn: sqlite3.Connection,
+    order_id: int,
+    action: str,
+    operator: str,
+    request_id: str,
+    piece_ids: list[int],
+) -> dict[str, Any]:
+    """签收 / 退回共用的落地逻辑（调用方已持有写事务）。"""
+    order = _order_row(conn, order_id)
+    piece_key = _piece_key_for_requests(conn, order_id, piece_ids)
+    existing = _existing_action(conn, order_id, request_id, action)
+    if existing is not None:
+        return _replay_or_conflict(existing, action, operator, piece_key)
+
+    if order["status"] not in ("SHIPPED",):
+        raise ServiceError(409, f"调拨单状态为 {order['status']}，只有发运后的单可以{_action_label(action)}")
+    if not piece_ids:
+        raise ServiceError(422, "至少指定一个件")
+    if len(piece_ids) != len(set(piece_ids)):
+        raise ServiceError(422, "同一请求内件不能重复")
+
+    src_id = order["source_workstation_id"]
+    dst_id = order["dest_workstation_id"]
+    land_ws_id = dst_id if action == "RECEIVE" else src_id
+
+    rows = {
+        r["piece_id"]: r
+        for r in conn.execute(
+            "SELECT * FROM transfer_order_piece WHERE order_id = ?", (order_id,)
+        )
+    }
+    # 整批先校验：任何一件无法处理则整批不生效（不占用请求号）
+    failures: list[str] = []
+    for piece_id in piece_ids:
+        row = rows.get(piece_id)
+        if row is None:
+            failures.append(f"件 {piece_id} 不在本调拨单内")
+        elif row["released_at"] is not None:
+            failures.append(f"件 {piece_id} 已落地（{row['state']}），不再受本单占用")
+        elif row["state"] != "IN_TRANSIT":
+            failures.append(f"件 {piece_id} 状态为 {row['state']}，只有仍在途的件可以处理")
+    if failures:
+        raise ServiceError(409, "整批不生效：" + "；".join(failures))
+
+    now = now_iso()
+    result_piece_ids = sorted(set(piece_ids))
+    # 先写请求幂等行，取得 action_id 供落地记录引用
+    cur = conn.execute(
+        """
+        INSERT INTO transfer_action(order_id, request_id, action, operator, piece_key, result_json, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (order_id, request_id, action, operator, piece_key, "{}", now),
+    )
+    action_id = cur.lastrowid
+
+    for piece_id in result_piece_ids:
+        piece = _piece_row(conn, piece_id)
+        # 落地一方：签收落在收件方（用建单预留的 RECEIPT 位），退回落在发件方
+        # （用发运时保留的 RETURN 位）；另一方为该件预留的位置随之释放。
+        landing_purpose = "RECEIPT" if action == "RECEIVE" else "RETURN"
+        release_ws_id = src_id if action == "RECEIVE" else dst_id
+        release_purpose = "RETURN" if action == "RECEIVE" else "RECEIPT"
+        if not _slot_exists(conn, land_ws_id, piece_id, landing_purpose):
+            # 正常不会发生（建单 / 发运已预留）；兜底补占仍受容量约束
+            _insert_slot(conn, land_ws_id, piece_id, "RESERVED", landing_purpose, order_id)
+        conn.execute(
+            "UPDATE workstation_slot SET state = 'ACTUAL' WHERE workstation_id = ?"
+            " AND piece_id = ? AND purpose = ?",
+            (land_ws_id, piece_id, landing_purpose),
+        )
+        # 释放另一方为该件预留的位置（不影响单中其他件）
+        conn.execute(
+            "DELETE FROM workstation_slot WHERE workstation_id = ? AND piece_id = ?"
+            " AND state = 'RESERVED' AND order_id = ? AND purpose = ?",
+            (release_ws_id, piece_id, order_id, release_purpose),
+        )
+        conn.execute(
+            "UPDATE piece SET status = 'AT_WORKSTATION', current_workstation_id = ?"
+            " WHERE piece_id = ?",
+            (land_ws_id, piece_id),
+        )
+        new_state = "RECEIVED" if action == "RECEIVE" else "RETURNED"
+        conn.execute(
+            "UPDATE transfer_order_piece SET state = ?, released_at = ? WHERE order_id = ? AND piece_id = ?",
+            (new_state, now, order_id, piece_id),
+        )
+        conn.execute(
+            """
+            INSERT INTO transfer_record(order_id, action_id, piece_id, action, operator, request_id,
+                                        from_workstation_id, to_workstation_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (order_id, action_id, piece_id, action, operator, request_id,
+             src_id if action == "RECEIVE" else dst_id, land_ws_id, now),
+        )
+
+    # 单状态：所有件都已落地（签收或退回）则关闭
+    remaining = conn.execute(
+        "SELECT COUNT(*) FROM transfer_order_piece WHERE order_id = ? AND released_at IS NULL",
+        (order_id,),
+    ).fetchone()[0]
+    new_status = "COMPLETED" if remaining == 0 else "SHIPPED"
+    if new_status == "COMPLETED":
+        conn.execute(
+            "UPDATE transfer_order SET status = 'COMPLETED', closed_at = ? WHERE order_id = ?",
+            (now, order_id),
+        )
+
+    result = {
+        "order_id": order_id,
+        "action": action,
+        "request_id": request_id,
+        "operator": operator,
+        "piece_ids": result_piece_ids,
+        "order_status": new_status,
+        "replayed": False,
+    }
+    conn.execute(
+        "UPDATE transfer_action SET result_json = ? WHERE action_id = ?",
+        (json.dumps(result), action_id),
+    )
+    return result
+
+
+def _action_label(action: str) -> str:
+    return {"SHIP": "发运", "RECEIVE": "签收", "RETURN": "退回"}.get(action, action)
+
+
+def receive_transfer_order(
+    db_path: Path | str | None,
+    order_id: int,
+    piece_ids: list[int],
+    operator: str,
+    request_id: str,
+) -> dict[str, Any]:
+    """分批签收至收件方：仅处理仍在途的件。"""
+    with _service_lock:
+        conn = get_connection(db_path)
+        try:
+            with _immediate_tx(conn):
+                return _land_pieces(conn, order_id, "RECEIVE", operator, request_id, piece_ids)
+        finally:
+            conn.close()
+
+
+def return_transfer_order(
+    db_path: Path | str | None,
+    order_id: int,
+    piece_ids: list[int],
+    operator: str,
+    request_id: str,
+) -> dict[str, Any]:
+    """分批退回至发件方：仅处理仍在途的件。"""
+    with _service_lock:
+        conn = get_connection(db_path)
+        try:
+            with _immediate_tx(conn):
+                return _land_pieces(conn, order_id, "RETURN", operator, request_id, piece_ids)
+        finally:
+            conn.close()
+
