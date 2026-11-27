@@ -239,6 +239,74 @@ class PieceOut(BaseModel):
     quality_frozen: bool
     active_order_id: Optional[int]
     created_at: str
+    # 实装结构：直接承载件（为空表示本身就是最外层整件）
+    direct_parent_piece_id: Optional[int] = None
+    # 最外层整件 id（未实装进任何件时即自身）
+    root_piece_id: int = 0
+    # 直接实装在本件内的子件
+    direct_child_piece_ids: list[int] = Field(default_factory=list)
+    # 是否为内部子件（不另占缓冲位、不能单独列入调拨单）
+    is_inner: bool = False
+
+
+# ------------------------------------------------------------------ 实装 / 拆件
+
+class AssemblyInstallRequest(BaseModel):
+    carrier_piece_id: int = Field(description="承载件（可以是更大总成的内件）")
+    installed_piece_id: int = Field(description="待装件：当前必须是最外层整件，可自带子件")
+    operator: str = Field(min_length=1, max_length=64)
+    workstation_id: Optional[int] = Field(
+        default=None, description="可选校验工位；不传则以两件当前工位为准，两者必须同工位"
+    )
+
+
+class AssemblyRemoveRequest(BaseModel):
+    carrier_piece_id: int = Field(description="直接承载子件的件")
+    child_piece_id: int = Field(description="要从直接承载件上拆下的子件，其下级随它一起拆下")
+    operator: str = Field(min_length=1, max_length=64)
+    workstation_id: Optional[int] = Field(default=None, description="可选校验工位")
+
+
+class AssemblyEventOut(BaseModel):
+    event_id: int
+    action: str
+    parent_piece_id: int
+    child_piece_id: int
+    workstation_id: int
+    operator: str
+    detail: Optional[str]
+    created_at: str
+
+
+class PieceCompositionOut(BaseModel):
+    piece_id: int
+    workpiece_id: int
+    workpiece_code: str
+    direct_parent_piece_id: Optional[int]
+    root_piece_id: int
+    is_inner: bool
+    # 以本件为根的完整父子树（递归），depth=0 为本件
+    tree: list["CompositionMemberOut"]
+    status: str
+    current_workstation_id: int
+    current_workstation_code: str
+    in_transit: bool
+    gate_valid: bool
+    quality_frozen: bool
+
+
+class CompositionMemberOut(BaseModel):
+    piece_id: int
+    workpiece_id: int
+    workpiece_code: str
+    gate_process_id: int
+    parent_piece_id: Optional[int]
+    depth: int
+
+
+class AssemblyActionOut(PieceOut):
+    # 装 / 拆完成后，涉及整件（拆下时为新最外层整件）的完整父子组成
+    composition: "PieceCompositionOut"
 
 
 class TransferOrderCreate(BaseModel):
@@ -313,3 +381,69 @@ class TransferActionResult(BaseModel):
     order_status: str
     replayed: bool = False
 
+
+# ------------------------------------------------------------------ 发运追溯
+
+class ShipmentCredentialEvidenceOut(BaseModel):
+    credential_id: Optional[int]
+    process_id: int
+    credential_kind: Optional[str]
+    # 该生效凭据当时快照引用的检验（每个项目一条；事后登记新读数不改变这里）
+    inspections: list[CredentialInspectionOut]
+
+
+class ShipmentSnapshotMemberOut(BaseModel):
+    piece_id: int
+    workpiece_id: int
+    workpiece_code: str
+    gate_process_id: int
+    parent_piece_id: Optional[int]
+    depth: int
+    # 发运当时该成员关口生效的开工 / 复核凭据及其检验快照
+    credential: Optional[ShipmentCredentialEvidenceOut]
+
+
+class ShipmentSnapshotOut(BaseModel):
+    snapshot_id: int
+    order_id: int
+    action_id: int
+    root_piece_id: int
+    root_workpiece_code: str
+    created_at: str
+    members: list[ShipmentSnapshotMemberOut]
+
+
+class ShipmentTraceOut(BaseModel):
+    order_id: int
+    order_status: str
+    shipped_at: Optional[str]
+    # 上线前的旧单没有快照，这里为空列表，不补猜旧单
+    snapshots: list[ShipmentSnapshotOut]
+
+
+class GaugeImpactOut(BaseModel):
+    gauge_id: int
+    window_id: int
+    window_start: str
+    window_end: str
+    order_id: int
+    order_status: str
+    shipped_at: Optional[str]
+    snapshot_id: int
+    root_piece_id: int
+    root_workpiece_code: str
+    member_piece_id: int
+    member_workpiece_id: int
+    member_workpiece_code: str
+    gate_process_id: int
+    credential_id: Optional[int]
+    credential_kind: Optional[str]
+    item_id: int
+    inspection_id: int
+    measured_at: str
+    reading: int
+
+
+
+# PieceCompositionOut 前向引用了稍后定义的 CompositionMemberOut，显式重建一次
+PieceCompositionOut.model_rebuild()

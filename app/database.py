@@ -214,6 +214,70 @@ CREATE TABLE IF NOT EXISTS transfer_record (
     created_at           TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_transfer_record_order ON transfer_record(order_id);
+
+-- ------------------------------------------------------------------ 实装 / 拆件
+-- 当前实物组成树：parent 直接承载 child。一个 child 至多有一个直接承载件
+-- （UNIQUE 约束兜底）；环由应用层“待装件必须是最外层整件”的校验排除。
+CREATE TABLE IF NOT EXISTS piece_assembly (
+    parent_piece_id  INTEGER NOT NULL REFERENCES piece(piece_id),
+    child_piece_id   INTEGER NOT NULL UNIQUE REFERENCES piece(piece_id),
+    installed_at     TEXT NOT NULL,
+    install_event_id INTEGER NOT NULL,
+    PRIMARY KEY (parent_piece_id, child_piece_id),
+    CHECK (parent_piece_id <> child_piece_id)
+);
+CREATE INDEX IF NOT EXISTS idx_assembly_parent ON piece_assembly(parent_piece_id);
+
+-- 装拆留痕（只增不改）：人、件、工位全部记录。REMOVE 时 detail 用 JSON 记下
+-- 随子件一起拆下的整组成员，保证事后可查。
+CREATE TABLE IF NOT EXISTS assembly_event (
+    event_id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    action         TEXT NOT NULL CHECK (action IN ('INSTALL', 'REMOVE')),
+    parent_piece_id INTEGER NOT NULL REFERENCES piece(piece_id),
+    child_piece_id  INTEGER NOT NULL REFERENCES piece(piece_id),
+    workstation_id INTEGER NOT NULL REFERENCES workstation(workstation_id),
+    operator       TEXT NOT NULL,
+    detail         TEXT,
+    created_at     TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_assembly_event_child ON assembly_event(child_piece_id);
+CREATE INDEX IF NOT EXISTS idx_assembly_event_parent ON assembly_event(parent_piece_id);
+
+-- ------------------------------------------------------- 发运追溯证据（只增不改）
+-- 每次发运为每个最外层整件留一份组成快照；只为上线后的新发运留证据，旧单无快照。
+-- 快照独立于当前 piece_assembly：事后拆换 / 补测 / 复核都不改变这里的历史依据。
+CREATE TABLE IF NOT EXISTS shipment_snapshot (
+    snapshot_id   INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id      INTEGER NOT NULL REFERENCES transfer_order(order_id),
+    action_id     INTEGER NOT NULL REFERENCES transfer_action(action_id),
+    root_piece_id INTEGER NOT NULL REFERENCES piece(piece_id),
+    created_at    TEXT NOT NULL,
+    UNIQUE (action_id, root_piece_id)
+);
+CREATE INDEX IF NOT EXISTS idx_ship_snapshot_order ON shipment_snapshot(order_id);
+
+-- 发运当时整件内的每个成员（含最外层本身，depth=0）及其当时的父子位置
+CREATE TABLE IF NOT EXISTS shipment_snapshot_member (
+    snapshot_id      INTEGER NOT NULL REFERENCES shipment_snapshot(snapshot_id),
+    piece_id         INTEGER NOT NULL REFERENCES piece(piece_id),
+    workpiece_id     INTEGER NOT NULL REFERENCES workpiece(workpiece_id),
+    gate_process_id  INTEGER NOT NULL REFERENCES process(process_id),
+    parent_piece_id  INTEGER REFERENCES piece(piece_id),
+    depth            INTEGER NOT NULL CHECK (depth >= 0),
+    PRIMARY KEY (snapshot_id, piece_id)
+);
+CREATE INDEX IF NOT EXISTS idx_ship_snapshot_member_piece ON shipment_snapshot_member(piece_id);
+
+-- 发运当时每个成员转运关口生效的开工 / 复核凭据（COMPLETE 不作为生效依据）。
+-- 凭据所引用的检验通过既有 credential_inspection 关联，事后不回填、不改写。
+CREATE TABLE IF NOT EXISTS shipment_snapshot_credential (
+    snapshot_id    INTEGER NOT NULL REFERENCES shipment_snapshot(snapshot_id),
+    piece_id       INTEGER NOT NULL REFERENCES piece(piece_id),
+    credential_id  INTEGER REFERENCES credential(credential_id),
+    process_id     INTEGER NOT NULL REFERENCES process(process_id),
+    credential_kind TEXT,
+    PRIMARY KEY (snapshot_id, piece_id)
+);
 """
 
 

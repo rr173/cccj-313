@@ -234,6 +234,59 @@ def get_piece(piece_id: int) -> dict:
     return services.get_piece(DB_PATH, piece_id)
 
 
+@app.get(
+    "/api/pieces/{piece_id}/composition",
+    response_model=schemas.PieceCompositionOut,
+    tags=["实装拆件"],
+)
+def get_piece_composition(piece_id: int) -> dict:
+    """直接承载件、最外层整件、实际工位 / 在途状态与完整父子组成树。"""
+    return services.get_piece_composition(DB_PATH, piece_id)
+
+
+@app.get(
+    "/api/assembly-events",
+    response_model=list[schemas.AssemblyEventOut],
+    tags=["实装拆件"],
+)
+def list_assembly_events(piece_id: Optional[int] = None) -> list[dict]:
+    """装拆留痕（人、件、工位）；可按件过滤。"""
+    return services.list_assembly_events(DB_PATH, piece_id)
+
+
+@app.post(
+    "/api/assemblies/install",
+    response_model=schemas.AssemblyActionOut,
+    status_code=201,
+    tags=["实装拆件"],
+)
+def install_assembly(payload: schemas.AssemblyInstallRequest) -> dict:
+    """把待装件实装到承载件上（待装件可自带子件，承载件也可以是内件）。"""
+    return services.install_assembly(
+        DB_PATH,
+        payload.carrier_piece_id,
+        payload.installed_piece_id,
+        payload.operator,
+        payload.workstation_id,
+    )
+
+
+@app.post(
+    "/api/assemblies/remove",
+    response_model=schemas.AssemblyActionOut,
+    tags=["实装拆件"],
+)
+def remove_assembly(payload: schemas.AssemblyRemoveRequest) -> dict:
+    """从直接承载件上拆下子件，其下级随它一起拆下，并在同工位占一个空位。"""
+    return services.remove_assembly(
+        DB_PATH,
+        payload.carrier_piece_id,
+        payload.child_piece_id,
+        payload.operator,
+        payload.workstation_id,
+    )
+
+
 @app.post(
     "/api/transfer-orders",
     response_model=schemas.TransferOrderOut,
@@ -301,4 +354,26 @@ def return_transfer_order(order_id: int, payload: schemas.TransferBatchRequest) 
     return services.return_transfer_order(
         DB_PATH, order_id, payload.piece_ids, payload.operator, payload.request_id
     )
+
+
+# --------------------------------------------------------------- 发运追溯证据
+
+@app.get(
+    "/api/transfer-orders/{order_id}/shipment-trace",
+    response_model=schemas.ShipmentTraceOut,
+    tags=["发运追溯"],
+)
+def shipment_trace(order_id: int) -> dict:
+    """一次实际发运：每个整件当时的完整父子组成与各成员关口的生效凭据证据。"""
+    return services.get_shipment_trace(DB_PATH, order_id)
+
+
+@app.get(
+    "/api/gauges/{gauge_id}/out-of-calibration-windows/{window_id}/impact",
+    response_model=list[schemas.GaugeImpactOut],
+    tags=["发运追溯"],
+)
+def gauge_window_impact(gauge_id: int, window_id: int) -> list[dict]:
+    """哪些发运单的哪些整件 / 成员，其发运凭据曾引用该量具在该窗内的测量。"""
+    return services.find_gauge_impact(DB_PATH, gauge_id, window_id)
 

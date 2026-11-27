@@ -1,7 +1,8 @@
 # 机加工工序放行后端
 
 单件机加工工序的检验登记、开工 / 完工放行、量具失准隔离与质量员复核服务，
-外加班组之间的**工位交接**（工位缓冲位、件、调拨单、分批签收 / 退回）。
+外加班组之间的**工位交接**（工位缓冲位、件、调拨单、分批签收 / 退回），
+以及**实装 / 拆件**（把已登记工件装成总成、返工拆换、按整件交接并保留发运追溯证据）。
 技术栈：Python + FastAPI + SQLite（标准库 `sqlite3`，无 ORM）。
 
 ## 1. 领域模型与状态
@@ -153,44 +154,129 @@
 | POST | `/transfer-orders` | 建单（发 / 收工位、件批次；即为每件预留收件位） |
 | GET | `/transfer-orders` / `/{id}` | 单列表 / 单详情（含落地记录：谁签收或退回了哪些件） |
 | POST | `/transfer-orders/{id}/cancel` | 撤销待发单，释放收件位 |
-| POST | `/transfer-orders/{id}/ship` | 整单发运（`operator`, `request_id`） |
+| POST | `/transfer-orders/{id}/ship` | 整单发运（`operator`, `request_id`）；发运瞬间快照组成与凭据证据 |
 | POST | `/transfer-orders/{id}/receive` | 分批签收（`operator`, `request_id`, `piece_ids`） |
 | POST | `/transfer-orders/{id}/return` | 分批退回（同上） |
 
-### 5.7 通过 HTTP 完成一笔交接
+## 5A. 实装 / 拆件与发运追溯
+
+### 5A.1 当前组成模型
+
+- **实装边 piece_assembly**：`parent 直接承载 child`。一个 child 至多有一个直接承载件
+  （`child_piece_id UNIQUE`），因此每件实物恒属于唯一一棵组成树；树的最外层称为
+  **整件（root）**，无承载件。
+- **工位账本只认整件**：只有 root 在 `workstation_slot` 占一个缓冲位；内部子件
+  不另占位。内部子件的工位 / 在途状态读时沿承载链解析，始终与其最外层整件一致，
+  发运、签收、退回都不逐件改它们的位置。
+- **装拆留痕 assembly_event**：只增不改，记录动作（`INSTALL` / `REMOVE`）、人、
+  承载件 / 子件、工位；`REMOVE` 的 `detail` 用 JSON 记下随子件一起拆下的整组成员。
+- 装 / 拆**不读取也不改动**任何检验、凭据、完工 / 隔离记录；质量冻结的在位整件
+  仍可拆换返工。
+
+### 5A.2 装配规则（POST `/api/assemblies/install`）
+
+请求：`carrier_piece_id`（承载件）、`installed_piece_id`（待装件）、`operator`，
+可选 `workstation_id`（传则额外校验两件确在该工位）。
+
+1. 待装件当前必须是**最外层整件**（不能已装在别的件里），但可以自带整棵子件；
+2. 承载件本身可以是更大总成的内件；两件必须属于**不同整件**；
+3. 两件的有效工位必须相同，且都在工位上（在途不可装）；
+4. 涉及的两个整件只要有一个在待发 / 在途单上（`released_at IS NULL`），拒绝改组成；
+5. 装配后待装件原来的实物缓冲位被**腾出**（其下级本就不占位），承载件所在整件
+   不新增占位——一个整件始终只占一位。
+
+### 5A.3 拆件规则（POST `/api/assemblies/remove`）
+
+请求：`carrier_piece_id`、`child_piece_id`、`operator`，可选 `workstation_id`。
+
+1. 必须从**直接承载件**上拆（传错承载件 409）；只断开这一条承载边，子件原有下级
+   随它整体离开，仍是一棵完整子树；
+2. 涉及整件待发 / 在途时拒绝（质量冻结不拦截）；
+3. 拆下的一组要在**同工位占一个真·空位**：`ACTUAL` 与 `RESERVED` 都计入容量，
+   已预留的位置不算空位，位满则整笔失败回滚；
+4. 拆出的子件成为新的最外层整件，整组只占一个 `ACTUAL(HOME)` 位。
+
+### 5A.4 整件交接与逐层关口
+
+- **只有最外层整件可以单独列入调拨单**；内部子件上单直接 409。
+- **发运**时，整件本身及每层实装子件的转运关口都须按第 2 节现有规则**有效完工**；
+  任一成员关口不满足，整单不发、仍待发，且不占用请求号。
+- 签收 / 退回仍按扫码的整件记账，质量变化不阻止如实落地；整件的当前
+  `quality_frozen` 随其**现有组成及各成员关口实时状态**变化（任一成员失效即冻结），
+  不改写任何历史交接记录。
+- 内部子件随整件在途、随整件落地，落地工位即其当前实际工位。
+
+### 5A.5 发运追溯证据（只增不改，仅覆盖上线后的新发运）
+
+发运成功的同一事务内，为单内每个整件写一份独立快照（与当前组成 / 凭据表解耦）：
+
+- `shipment_snapshot` / `shipment_snapshot_member`：发运当时完整的父子组成
+  （含每件的 `parent_piece_id`、`depth`，depth=0 为整件本身）；
+- `shipment_snapshot_credential`：每个成员转运关口**当时生效**的开工 / 复核凭据
+  （最近一张 `START` / `REVIEW`），凭据快照引用的检验仍通过既有
+  `credential_inspection` 取得；事后登记新读数、补测、复核都不回填这里。
+- 因此件后来被拆换、补测或复核，**查到的历史依据不变**；上线前的旧单没有快照，
+  追溯接口返回空 `snapshots`，不补猜旧单。
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/assemblies/install` | 实装（承载件、待装件、操作人、可选校验工位） |
+| POST | `/assemblies/remove` | 从直接承载件拆子件，下级随拆，占同工位一个空位 |
+| GET | `/assembly-events` | 装拆留痕（人、件、工位），可 `?piece_id=` 过滤 |
+| GET | `/pieces/{id}/composition` | 直接承载件、最外层整件、工位 / 在途状态与完整父子树 |
+| GET | `/transfer-orders/{id}/shipment-trace` | 一次发运中每个整件当时的组成与各成员生效凭据 |
+| GET | `/gauges/{gid}/out-of-calibration-windows/{wid}/impact` | 该失准窗内的测量曾被哪些发运单的哪些整件 / 成员凭据引用 |
+
+`GET /pieces/{id}` 的返回同时给出 `direct_parent_piece_id`、`root_piece_id`、
+`direct_child_piece_ids`、`is_inner`；内部子件的 `status` / 工位以其整件为准。
+
+量具失准影响查询的判定口径严格限定为**发运快照里各关口凭据所引用的测量**
+（快照凭据 → `credential_inspection` → `inspection`，量具与测量时间落在该半开窗内），
+逐行返回发运单、整件、成员、关口、凭据与具体检验。
+
+### 5A.6 并发与一致性
+
+装 / 拆与既有写操作共用进程内 `_service_lock`，并在显式 `BEGIN IMMEDIATE`
+事务内完成“校验 + 组成改写 + 缓冲位变动 + 留痕 / 快照”，跨进程串行化；唯一约束
+（一个 child 一个承载件、一件至多一张活动单）与容量触发器作为最后防线。
+失败整体回滚，不留下半套组成、半套货位或半条交接证据。
+
+### 5A.7 通过 HTTP 装拆并查发运追溯
 
 ```bash
 B=http://127.0.0.1:8000/api
 
-# 0) 既有能力：建工件、登记检验、开工 / 完工，直到关口工序 COMPLETED
-#    （分别 POST /workpieces、/inspections、/processes/{id}/start、/complete）
+# 1) 实装：先把 C 装进 B，再把自带子件的 B 整体装进 A（两件须同工位）
+curl -X POST $B/assemblies/install -H 'content-type: application/json' \
+  -d '{"carrier_piece_id":2,"installed_piece_id":3,"operator":"装配工-赵"}'
+curl -X POST $B/assemblies/install -H 'content-type: application/json' \
+  -d '{"carrier_piece_id":1,"installed_piece_id":2,"operator":"装配工-赵"}'
 
-# 1) 建两个工位
-curl -X POST $B/workstations -H 'content-type: application/json' \
-  -d '{"code":"WS-SRC","name":"发件工位","capacity":3}'
-curl -X POST $B/workstations -H 'content-type: application/json' \
-  -d '{"code":"WS-DST","name":"收件工位","capacity":2}'
+# 2) 查任一工件的承载关系与完整父子树（内部子件工位随其整件）
+curl $B/pieces/2/composition
 
-# 2) 用已有工件登记实物：初始在发件工位，关口为该件的完工工序
-curl -X POST $B/pieces -H 'content-type: application/json' \
-  -d '{"workpiece_id":1,"gate_process_id":2,"workstation_id":1}'
-
-# 3) 建单：立即为件在收件方预留一个位（实物尚未移动）
+# 3) 只有整件 1 能上单；发运逐层校验 A、B、C 的关口，并在发运瞬间留快照
 curl -X POST $B/transfer-orders -H 'content-type: application/json' \
   -d '{"source_workstation_id":1,"dest_workstation_id":2,"piece_ids":[1]}'
-
-# 4) 扫码发运：整单关口须有效完工，发件方为每件保留退回位
 curl -X POST $B/transfer-orders/1/ship -H 'content-type: application/json' \
-  -d '{"operator":"张三","request_id":"SHIP-20261127-01"}'
-
-# 5) 分批签收到收件方（也可 POST .../return 退回发件方）
+  -d '{"operator":"司机-钱","request_id":"SHIP-1"}'
 curl -X POST $B/transfer-orders/1/receive -H 'content-type: application/json' \
-  -d '{"operator":"李四","request_id":"RCV-20261127-01","piece_ids":[1]}'
+  -d '{"operator":"收件-孙","request_id":"RCV-1","piece_ids":[1]}'
 
-# 6) 班组长查询
-curl $B/workstations/2          # 实际在位 vs 已预留、剩余位置
-curl $B/pieces/1                # 每件实物在哪、是否质量冻结
-curl $B/transfer-orders/1       # 每件状态 + 谁签收 / 退回了哪些件
+# 4) 查这次实际发运：当时的完整父子组成 + 每个成员关口当时生效的凭据 / 检验
+curl $B/transfer-orders/1/shipment-trace
+
+# 5) 事后发现量具失准：登记窗口后，反查哪些发运的哪些成员凭据引用了窗内测量
+curl -X POST $B/gauges/2/out-of-calibration-windows -H 'content-type: application/json' \
+  -d '{"window_start":"2026-11-27T07:00:00+00:00",
+       "window_end":"2026-11-27T09:00:00+00:00","note":"事后失准"}'
+curl $B/gauges/2/out-of-calibration-windows/1/impact
+
+# 6) 返工拆件：从直接承载件 1 拆下 2（其下级 3 随拆），同工位须有一个真·空位
+curl -X POST $B/assemblies/remove -H 'content-type: application/json' \
+  -d '{"carrier_piece_id":1,"child_piece_id":2,"operator":"返工工-周"}'
+# 拆换不改变第 4 步查到的历史快照；装拆留痕可按件查
+curl "$B/assembly-events?piece_id=2"
 ```
 
 ## 6. HTTP 接口（既有放行部分，前缀 `/api`）
@@ -236,10 +322,14 @@ pytest -q
 
 ```
 app/
-  database.py   # SQLite 连接、PRAGMA、建表 DDL
+  database.py   # SQLite 连接、PRAGMA、建表 DDL（含实装树、装拆留痕、发运快照）
   schemas.py    # Pydantic 请求 / 响应模型
-  services.py   # 全部业务规则、隔离传导、工位交接、跨进程写锁
+  services.py   # 全部业务规则、隔离传导、工位交接、实装拆件、发运追溯、跨进程写锁
   main.py       # FastAPI 路由与异常映射
-tests/          # 放行链路、隔离 / 复核、DAG 校验、并发、随机不变量、工位交接
+tests/          # 放行链路、隔离 / 复核、DAG 校验、并发、随机不变量、工位交接、实装拆件与追溯
 run.sh          # 启动脚本
 ```
+
+所有建表 DDL 均为 `CREATE TABLE IF NOT EXISTS`，对既有库直接启动即幂等迁移，
+旧数据（工件、检验、凭据、工位、调拨单、落地记录）原样保留；发运追溯证据只对
+迁移后的新发运生成，不回填、不补猜旧单。

@@ -990,6 +990,73 @@ def _active_order_for_piece(conn: sqlite3.Connection, piece_id: int) -> Optional
     return row["order_id"] if row is not None else None
 
 
+# ------------------------------------------------------------- 实装组成树（当前态）
+#
+# 不变量：
+# * 一个 child 至多有一个直接承载件（piece_assembly.child_piece_id UNIQUE）；
+# * 只有最外层整件（root，无 parent）在 workstation_slot 中占位，内部子件不占位；
+# * 内部子件的工位 / 在途状态始终与其最外层整件一致，读时沿 parent 链解析。
+
+def _assembly_parent(conn: sqlite3.Connection, piece_id: int) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM piece_assembly WHERE child_piece_id = ?", (piece_id,)
+    ).fetchone()
+
+
+def _root_piece_id(conn: sqlite3.Connection, piece_id: int) -> int:
+    """沿承载链找到最外层整件 id。组成环由“待装件必须是 root”的写入校验排除。"""
+    cur = piece_id
+    seen: set[int] = set()
+    while True:
+        row = conn.execute(
+            "SELECT parent_piece_id FROM piece_assembly WHERE child_piece_id = ?", (cur,)
+        ).fetchone()
+        if row is None:
+            return cur
+        if cur in seen:  # pragma: no cover - 写入侧已排除环
+            raise ServiceError(500, f"件 {piece_id} 的实装组成存在环，数据状态异常")
+        seen.add(cur)
+        cur = row["parent_piece_id"]
+
+
+def _subtree(conn: sqlite3.Connection, root_id: int) -> list[tuple[int, Optional[int], int]]:
+    """以 root_id 为最外层整件的完整子树：返回 (piece_id, parent_piece_id, depth)。
+
+    深度优先、同父下按 piece_id 升序，depth=0 为最外层整件本身。
+    """
+    result: list[tuple[int, Optional[int], int]] = []
+    stack: list[tuple[int, Optional[int], int]] = [(root_id, None, 0)]
+    while stack:
+        pid, parent_id, depth = stack.pop()
+        result.append((pid, parent_id, depth))
+        children = [
+            r["child_piece_id"]
+            for r in conn.execute(
+                "SELECT child_piece_id FROM piece_assembly WHERE parent_piece_id = ?"
+                " ORDER BY child_piece_id DESC",
+                (pid,),
+            )
+        ]
+        for child_id in children:
+            stack.append((child_id, pid, depth + 1))
+    return result
+
+
+def _effective_piece_state(
+    conn: sqlite3.Connection, piece: sqlite3.Row
+) -> tuple[str, int, int]:
+    """返回 (有效状态, 实际所在工位 id, 最外层整件 id)。
+
+    内部子件自身的 piece 行不随发运 / 落地更新，其工位与在途状态一律以最外层
+    整件为准——实物随整件一起移动。
+    """
+    root_id = _root_piece_id(conn, piece["piece_id"])
+    if root_id == piece["piece_id"]:
+        return piece["status"], piece["current_workstation_id"], root_id
+    root = _piece_row(conn, root_id)
+    return root["status"], root["current_workstation_id"], root_id
+
+
 def _piece_dict(conn: sqlite3.Connection, piece: sqlite3.Row) -> dict[str, Any]:
     wp = conn.execute(
         "SELECT code FROM workpiece WHERE workpiece_id = ?", (piece["workpiece_id"],)
@@ -997,24 +1064,53 @@ def _piece_dict(conn: sqlite3.Connection, piece: sqlite3.Row) -> dict[str, Any]:
     gate = conn.execute(
         "SELECT code FROM process WHERE process_id = ?", (piece["gate_process_id"],)
     ).fetchone()
+    parent_row = _assembly_parent(conn, piece["piece_id"])
+    root_id = _root_piece_id(conn, piece["piece_id"])
+    eff_status, eff_ws_id, _ = _effective_piece_state(conn, piece)
     ws = conn.execute(
-        "SELECT code FROM workstation WHERE workstation_id = ?",
-        (piece["current_workstation_id"],),
+        "SELECT code FROM workstation WHERE workstation_id = ?", (eff_ws_id,)
     ).fetchone()
-    valid, _ = _gate_valid(conn, piece)
+    child_ids = [
+        r["child_piece_id"]
+        for r in conn.execute(
+            "SELECT child_piece_id FROM piece_assembly WHERE parent_piece_id = ?"
+            " ORDER BY child_piece_id",
+            (piece["piece_id"],)
+        )
+    ]
+
+    # 自身关口的实时有效性
+    own_valid, _ = _gate_valid(conn, piece)
+    if root_id == piece["piece_id"]:
+        # 整件的当前质量冻结随现有组成及各关口状态变化：任一成员关口失效即冻结
+        all_valid = True
+        for member_id, _, _ in _subtree(conn, root_id):
+            member = _piece_row(conn, member_id)
+            valid, _ = _gate_valid(conn, member)
+            if not valid:
+                all_valid = False
+                break
+        gate_valid = all_valid
+    else:
+        gate_valid = own_valid
+
     return {
         "piece_id": piece["piece_id"],
         "workpiece_id": piece["workpiece_id"],
         "workpiece_code": wp["code"],
         "gate_process_id": piece["gate_process_id"],
         "gate_process_code": gate["code"],
-        "status": piece["status"],
-        "current_workstation_id": piece["current_workstation_id"],
+        "status": eff_status,
+        "current_workstation_id": eff_ws_id,
         "current_workstation_code": ws["code"],
-        "gate_valid": valid,
-        "quality_frozen": not valid,
-        "active_order_id": _active_order_for_piece(conn, piece["piece_id"]),
+        "gate_valid": gate_valid,
+        "quality_frozen": not gate_valid,
+        "active_order_id": _active_order_for_piece(conn, root_id),
         "created_at": piece["created_at"],
+        "direct_parent_piece_id": parent_row["parent_piece_id"] if parent_row else None,
+        "root_piece_id": root_id,
+        "direct_child_piece_ids": child_ids,
+        "is_inner": parent_row is not None,
     }
 
 
@@ -1251,6 +1347,11 @@ def create_transfer_order(
                         failures.append(f"件 {piece_id}：{exc.detail}")
                         continue
                     pieces.append(piece)
+                    if _assembly_parent(conn, piece_id) is not None:
+                        failures.append(
+                            f"件 {piece_id} 是总成内部子件，只有最外层整件可以单独列入调拨单"
+                        )
+                        continue
                     if piece["status"] != "AT_WORKSTATION":
                         failures.append(f"件 {piece_id} 在途中，不能上单")
                         continue
@@ -1426,15 +1527,21 @@ def ship_transfer_order(
                 if len(pending) != len(rows) or not pending:
                     raise ServiceError(409, "调拨单存在已落地 / 释放的件，不能整单发运")
 
-                # 关口有效性在发运瞬间实时校验（隔离 / 失效会立即拦截，不用旧快照）
+                # 关口有效性在发运瞬间实时校验（隔离 / 失效会立即拦截，不用旧快照）。
+                # 整件本身及每层实装子件的转运关口都须按现有规则有效完工；
+                # 任何一个关口不满足，整单不发。
                 failures: list[str] = []
                 for r in pending:
-                    piece = _piece_row(conn, r["piece_id"])
-                    valid, issues = _gate_valid(conn, piece)
-                    if not valid:
-                        failures.append(
-                            f"件 {piece['piece_id']} 关口未有效完工：" + "；".join(issues)
-                        )
+                    root_piece = _piece_row(conn, r["piece_id"])
+                    for member_id, _, depth in _subtree(conn, root_piece["piece_id"]):
+                        member = _piece_row(conn, member_id)
+                        valid, issues = _gate_valid(conn, member)
+                        if not valid:
+                            label = "最外层整件" if depth == 0 else f"第 {depth} 层子件"
+                            failures.append(
+                                f"整件 {root_piece['piece_id']} 的{label} {member_id} "
+                                f"关口未有效完工：" + "；".join(issues)
+                            )
                 if failures:
                     # 整单仍待发，不占用请求号
                     raise ServiceError(409, "存在关口未有效完工的件，整单仍待发：" + "；".join(failures))
@@ -1473,6 +1580,13 @@ def ship_transfer_order(
                         "UPDATE piece SET status = 'IN_TRANSIT' WHERE piece_id = ?",
                         (piece["piece_id"],),
                     )
+                    # 内部子件随整件一起在途（工位字段在落地时再随整件更新）
+                    for member_id, _, depth in _subtree(conn, piece["piece_id"]):
+                        if depth > 0:
+                            conn.execute(
+                                "UPDATE piece SET status = 'IN_TRANSIT' WHERE piece_id = ?",
+                                (member_id,),
+                            )
                     conn.execute(
                         "UPDATE transfer_order_piece SET state = 'IN_TRANSIT' WHERE order_id = ?"
                         " AND piece_id = ?",
@@ -1492,13 +1606,18 @@ def ship_transfer_order(
                     "order_status": "SHIPPED",
                     "replayed": False,
                 }
-                conn.execute(
+                cur = conn.execute(
                     """
                     INSERT INTO transfer_action(order_id, request_id, action, operator, piece_key, result_json, created_at)
                     VALUES (?, ?, 'SHIP', ?, ?, ?, ?)
                     """,
                     (order_id, request_id, operator, piece_key, json.dumps(result), now),
                 )
+                ship_action_id = cur.lastrowid
+                # 发运瞬间为每个整件留完整组成 + 各成员关口生效凭据证据；
+                # 只写独立快照表，事后拆换 / 补测 / 复核都不改变这里。
+                for r in pending:
+                    _write_shipment_snapshot(conn, order_id, ship_action_id, r["piece_id"], now)
             return result
         finally:
             conn.close()
@@ -1587,6 +1706,16 @@ def _land_pieces(
             " WHERE piece_id = ?",
             (land_ws_id, piece_id),
         )
+        # 整件内的每层子件随整件一起落地：同步它们的工位与在途状态，
+        # 否则日后拆出的新整件会带着旧工位，与其实际缓冲位不一致。
+        for member_id, _, depth in _subtree(conn, piece_id):
+            if depth == 0:
+                continue
+            conn.execute(
+                "UPDATE piece SET status = 'AT_WORKSTATION', current_workstation_id = ?"
+                " WHERE piece_id = ?",
+                (land_ws_id, member_id),
+            )
         new_state = "RECEIVED" if action == "RECEIVE" else "RETURNED"
         conn.execute(
             "UPDATE transfer_order_piece SET state = ?, released_at = ? WHERE order_id = ? AND piece_id = ?",
@@ -1667,3 +1796,557 @@ def return_transfer_order(
         finally:
             conn.close()
 
+
+
+# ====================================================================== 实装 / 拆件
+#
+# 工位账本在装配语义下的不变量：
+# * 只有最外层整件（root）占一个缓冲位；内部子件在 workstation_slot 中没有任何行。
+# * 装配：待装件必须是 root（可自带子件），其原 ACTUAL 位被腾出；承载件所在的
+#   整件不新增占位。
+# * 拆件：被拆出的一组要在同工位占一个“真·空位”——ACTUAL 与 RESERVED 都计入
+#   容量，已预留位置不算空位。
+# * 待发 / 在途（transfer_order_piece.released_at IS NULL）的整件，其组成冻结。
+# * 质量冻结不阻止拆换返工：装 / 拆不读取也不改动任何检验、凭据、完工记录。
+
+
+def _assert_root_not_on_active_order(conn: sqlite3.Connection, root_id: int) -> None:
+    active = _active_order_for_piece(conn, root_id)
+    if active is not None:
+        raise ServiceError(
+            409,
+            f"整件 {root_id} 在调拨单 {active} 上待发或在途，不能改变它的组成",
+        )
+
+
+def install_assembly(
+    db_path: Path | str | None,
+    carrier_piece_id: int,
+    installed_piece_id: int,
+    operator: str,
+    workstation_id: Optional[int],
+) -> dict[str, Any]:
+    """把待装件实装到承载件上。
+
+    待装件当前必须是最外层整件（不能已装在别的件里），但可以自带子件；承载件
+    本身可以是更大总成的内件。两者须在同一工位、属于不同整件。
+    """
+    if carrier_piece_id == installed_piece_id:
+        raise ServiceError(422, "承载件与待装件不能是同一件")
+
+    with _service_lock:
+        conn = get_connection(db_path)
+        try:
+            with _immediate_tx(conn):
+                carrier = _piece_row(conn, carrier_piece_id)
+                installed = _piece_row(conn, installed_piece_id)
+
+                # 待装件不能已装在别的件里
+                if _assembly_parent(conn, installed_piece_id) is not None:
+                    raise ServiceError(
+                        409, f"待装件 {installed_piece_id} 已实装在别的件内，不能重复实装"
+                    )
+                # 两者必须属于不同的整件
+                carrier_root = _root_piece_id(conn, carrier_piece_id)
+                installed_root = _root_piece_id(conn, installed_piece_id)
+                if carrier_root == installed_root:
+                    raise ServiceError(
+                        409, f"承载件 {carrier_piece_id} 与待装件 {installed_piece_id} 已属于同一整件"
+                    )
+
+                # 有效工位 / 在途状态沿整件解析；两者都须在工位上且同工位
+                c_status, c_ws, _ = _effective_piece_state(conn, carrier)
+                i_status, i_ws, _ = _effective_piece_state(conn, installed)
+                if c_status != "AT_WORKSTATION" or i_status != "AT_WORKSTATION":
+                    raise ServiceError(409, "在途的件不能实装，须先落地")
+                if c_ws != i_ws:
+                    raise ServiceError(
+                        409,
+                        f"承载件与待装件不在同一工位（分别为 {c_ws}、{i_ws}），不能实装",
+                    )
+                if workstation_id is not None:
+                    _get_workstation(conn, workstation_id)
+                    if workstation_id != c_ws:
+                        raise ServiceError(
+                            409, f"两件当前不在指定工位 {workstation_id}（实际在 {c_ws}）"
+                        )
+                ws_id = c_ws
+
+                # 涉及的整件只要待发或在途，就不能改组成
+                _assert_root_not_on_active_order(conn, carrier_root)
+                _assert_root_not_on_active_order(conn, installed_root)
+
+                now = now_iso()
+                cur = conn.execute(
+                    """
+                    INSERT INTO assembly_event(action, parent_piece_id, child_piece_id,
+                                               workstation_id, operator, detail, created_at)
+                    VALUES ('INSTALL', ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        carrier_piece_id,
+                        installed_piece_id,
+                        ws_id,
+                        operator,
+                        json.dumps(
+                            {
+                                "carrier_root_piece_id": carrier_root,
+                                "installed_root_piece_id": installed_root,
+                            },
+                            ensure_ascii=False,
+                        ),
+                        now,
+                    ),
+                )
+                event_id = cur.lastrowid
+                conn.execute(
+                    """
+                    INSERT INTO piece_assembly(parent_piece_id, child_piece_id, installed_at, install_event_id)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (carrier_piece_id, installed_piece_id, now, event_id),
+                )
+
+                # 待装件是 root：腾出它原来的实物缓冲位（子件本就不占位，无需处理）。
+                deleted = conn.execute(
+                    "DELETE FROM workstation_slot WHERE piece_id = ?", (installed_piece_id,)
+                ).rowcount
+                if deleted == 0:  # pragma: no cover - root 在工位时必有 ACTUAL 位
+                    raise ServiceError(
+                        500, f"待装件 {installed_piece_id} 缺少实物缓冲位记录，数据状态异常"
+                    )
+            carrier_row = _piece_row(conn, carrier_piece_id)
+            result = _piece_dict(conn, carrier_row)
+            result["composition"] = _composition_dict(
+                conn, _root_piece_id(conn, carrier_piece_id)
+            )
+            return result
+        finally:
+            conn.close()
+
+
+def remove_assembly(
+    db_path: Path | str | None,
+    carrier_piece_id: int,
+    child_piece_id: int,
+    operator: str,
+    workstation_id: Optional[int],
+) -> dict[str, Any]:
+    """从直接承载件上拆下指定子件；其原有下级随它一起拆下。"""
+    with _service_lock:
+        conn = get_connection(db_path)
+        try:
+            with _immediate_tx(conn):
+                carrier = _piece_row(conn, carrier_piece_id)
+                child = _piece_row(conn, child_piece_id)
+                link = conn.execute(
+                    "SELECT * FROM piece_assembly WHERE child_piece_id = ?", (child_piece_id,)
+                ).fetchone()
+                if link is None:
+                    raise ServiceError(409, f"件 {child_piece_id} 不是任何件的实装子件，不能拆件")
+                if link["parent_piece_id"] != carrier_piece_id:
+                    raise ServiceError(
+                        409,
+                        f"件 {child_piece_id} 的直接承载件是 {link['parent_piece_id']}，"
+                        f"不是 {carrier_piece_id}；拆件必须从直接承载件上拆",
+                    )
+
+                # 工位：两件的有效工位都沿承载整件解析，必须同工位且在工位上
+                c_status, c_ws, carrier_root = _effective_piece_state(conn, carrier)
+                ch_status, ch_ws, _ = _effective_piece_state(conn, child)
+                if c_status != "AT_WORKSTATION" or ch_status != "AT_WORKSTATION":
+                    raise ServiceError(409, "在途的件不能拆件，须先落地")
+                if c_ws != ch_ws:  # pragma: no cover - 同一棵树工位必然一致
+                    raise ServiceError(409, "承载件与子件不在同一工位，不能拆件")
+                if workstation_id is not None:
+                    _get_workstation(conn, workstation_id)
+                    if workstation_id != c_ws:
+                        raise ServiceError(
+                            409, f"件当前不在指定工位 {workstation_id}（实际在 {c_ws}）"
+                        )
+                ws_id = c_ws
+
+                # 待发 / 在途整件组成冻结（质量冻结不拦截）
+                _assert_root_not_on_active_order(conn, carrier_root)
+
+                # 被拆下的一组（含子件及其全部下级）需要在同工位占一个真·空位：
+                # ACTUAL 与 RESERVED 都占容量，已预留位置不算空位。
+                removed_members = _subtree(conn, child_piece_id)
+                if _available_slots(conn, ws_id) < 1:
+                    ws = _get_workstation(conn, ws_id)
+                    raise ServiceError(
+                        409,
+                        f"工位 {ws['code']}（id={ws_id}）没有空缓冲位（已预留位置不算空位），"
+                        f"无法容纳拆下的一组 {len(removed_members)} 件",
+                    )
+
+                now = now_iso()
+                cur = conn.execute(
+                    """
+                    INSERT INTO assembly_event(action, parent_piece_id, child_piece_id,
+                                               workstation_id, operator, detail, created_at)
+                    VALUES ('REMOVE', ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        carrier_piece_id,
+                        child_piece_id,
+                        ws_id,
+                        operator,
+                        json.dumps(
+                            {
+                                "removed_member_piece_ids": [pid for pid, _, _ in removed_members],
+                            },
+                            ensure_ascii=False,
+                        ),
+                        now,
+                    ),
+                )
+                event_id = cur.lastrowid
+
+                # 只断开直接承载边；孙级行随子件一起离开，但保留在表中，
+                # 从而维持“原有下级随它一起拆下”的完整子树。
+                conn.execute(
+                    "DELETE FROM piece_assembly WHERE parent_piece_id = ? AND child_piece_id = ?",
+                    (carrier_piece_id, child_piece_id),
+                )
+                # 拆下的一组成为新的最外层整件，占同工位一个 ACTUAL 位（整组只占一位）
+                _insert_slot(conn, ws_id, child_piece_id, "ACTUAL", "HOME")
+                # 留痕、断边与位次在同一事务内：失败整体回滚，不留半套组成或货位
+            child_row = _piece_row(conn, child_piece_id)
+            result = _piece_dict(conn, child_row)
+            result["composition"] = _composition_dict(conn, child_piece_id)
+            return result
+        finally:
+            conn.close()
+
+
+def list_assembly_events(
+    db_path: Path | str | None, piece_id: Optional[int] = None
+) -> list[dict[str, Any]]:
+    """装拆留痕：人、件、工位。可按件过滤（含其作为承载件或子件的记录）。"""
+    conn = get_connection(db_path)
+    try:
+        if piece_id is not None:
+            if conn.execute(
+                "SELECT 1 FROM piece WHERE piece_id = ?", (piece_id,)
+            ).fetchone() is None:
+                raise ServiceError(404, f"件 {piece_id} 不存在")
+            rows = conn.execute(
+                "SELECT * FROM assembly_event WHERE parent_piece_id = ? OR child_piece_id = ?"
+                " ORDER BY event_id",
+                (piece_id, piece_id),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM assembly_event ORDER BY event_id"
+            ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def _composition_dict(conn: sqlite3.Connection, piece_id: int) -> dict[str, Any]:
+    """同连接内的组成查询（供写事务返回值复用，避免事务中另开连接）。"""
+    piece = _piece_row(conn, piece_id)
+    root_id = _root_piece_id(conn, piece_id)
+    parent_row = _assembly_parent(conn, piece_id)
+    eff_status, eff_ws_id, _ = _effective_piece_state(conn, piece)
+    ws = conn.execute(
+        "SELECT code FROM workstation WHERE workstation_id = ?", (eff_ws_id,)
+    ).fetchone()
+    wp = conn.execute(
+        "SELECT code FROM workpiece WHERE workpiece_id = ?", (piece["workpiece_id"],)
+    ).fetchone()
+
+    # 以查询件为根的可见子树，depth 从 0 重新计
+    tree: list[dict[str, Any]] = []
+    for pid, parent_pid, depth in _subtree(conn, piece_id):
+        member = _piece_row(conn, pid)
+        member_wp = conn.execute(
+            "SELECT code FROM workpiece WHERE workpiece_id = ?", (member["workpiece_id"],)
+        ).fetchone()
+        tree.append(
+            {
+                "piece_id": pid,
+                "workpiece_id": member["workpiece_id"],
+                "workpiece_code": member_wp["code"],
+                "gate_process_id": member["gate_process_id"],
+                "parent_piece_id": parent_pid,
+                "depth": depth,
+            }
+        )
+
+    own_valid, _ = _gate_valid(conn, piece)
+    if root_id == piece_id:
+        all_valid = True
+        for member_id, _, _ in _subtree(conn, root_id):
+            valid, _ = _gate_valid(conn, _piece_row(conn, member_id))
+            if not valid:
+                all_valid = False
+                break
+        gate_valid = all_valid
+    else:
+        gate_valid = own_valid
+
+    return {
+        "piece_id": piece_id,
+        "workpiece_id": piece["workpiece_id"],
+        "workpiece_code": wp["code"],
+        "direct_parent_piece_id": parent_row["parent_piece_id"] if parent_row else None,
+        "root_piece_id": root_id,
+        "is_inner": parent_row is not None,
+        "tree": tree,
+        "status": eff_status,
+        "current_workstation_id": eff_ws_id,
+        "current_workstation_code": ws["code"],
+        "in_transit": eff_status == "IN_TRANSIT",
+        "gate_valid": gate_valid,
+        "quality_frozen": not gate_valid,
+    }
+
+
+def get_piece_composition(db_path: Path | str | None, piece_id: int) -> dict[str, Any]:
+    """查任一工件：直接承载件、最外层整件、实际所在工位或在途状态与完整父子树。"""
+    conn = get_connection(db_path)
+    try:
+        # 先确认件存在（不存在抛 404），再走同连接组装
+        _piece_row(conn, piece_id)
+        return _composition_dict(conn, piece_id)
+    finally:
+        conn.close()
+
+
+# ============================================================ 发运追溯证据（快照）
+
+def _write_shipment_snapshot(
+    conn: sqlite3.Connection,
+    order_id: int,
+    action_id: int,
+    root_piece_id: int,
+    now: str,
+) -> int:
+    """发运事务内调用：快照整件当时的完整组成与各成员关口的生效凭据。
+
+    与当前 piece_assembly / credential 表完全解耦，之后的拆换、补测、复核都
+    不会改写本快照（历史交接记录不可变）。
+    """
+    cur = conn.execute(
+        """
+        INSERT INTO shipment_snapshot(order_id, action_id, root_piece_id, created_at)
+        VALUES (?, ?, ?, ?)
+        """,
+        (order_id, action_id, root_piece_id, now),
+    )
+    snapshot_id = cur.lastrowid
+    for pid, parent_pid, depth in _subtree(conn, root_piece_id):
+        member = _piece_row(conn, pid)
+        conn.execute(
+            """
+            INSERT INTO shipment_snapshot_member(
+                snapshot_id, piece_id, workpiece_id, gate_process_id, parent_piece_id, depth)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                snapshot_id,
+                pid,
+                member["workpiece_id"],
+                member["gate_process_id"],
+                parent_pid,
+                depth,
+            ),
+        )
+        active = _active_credential(conn, member["gate_process_id"])
+        conn.execute(
+            """
+            INSERT INTO shipment_snapshot_credential(
+                snapshot_id, piece_id, credential_id, process_id, credential_kind)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                snapshot_id,
+                pid,
+                active["credential_id"] if active else None,
+                member["gate_process_id"],
+                active["kind"] if active else None,
+            ),
+        )
+    return snapshot_id
+
+
+def _snapshot_detail(conn: sqlite3.Connection, snap: sqlite3.Row) -> dict[str, Any]:
+    root_wp = conn.execute(
+        """
+        SELECT w.code FROM workpiece w
+        JOIN piece p ON p.workpiece_id = w.workpiece_id
+        WHERE p.piece_id = ?
+        """,
+        (snap["root_piece_id"],),
+    ).fetchone()
+    members_out: list[dict[str, Any]] = []
+    members = conn.execute(
+        "SELECT * FROM shipment_snapshot_member WHERE snapshot_id = ? ORDER BY depth, piece_id",
+        (snap["snapshot_id"],),
+    ).fetchall()
+    for m in members:
+        wp = conn.execute(
+            "SELECT code FROM workpiece WHERE workpiece_id = ?", (m["workpiece_id"],)
+        ).fetchone()
+        cred_row = conn.execute(
+            "SELECT * FROM shipment_snapshot_credential WHERE snapshot_id = ? AND piece_id = ?",
+            (snap["snapshot_id"], m["piece_id"]),
+        ).fetchone()
+        credential = None
+        if cred_row is not None:
+            inspections: list[dict[str, Any]] = []
+            if cred_row["credential_id"] is not None:
+                inspections = [
+                    dict(r)
+                    for r in conn.execute(
+                        "SELECT item_id, inspection_id FROM credential_inspection"
+                        " WHERE credential_id = ? ORDER BY item_id",
+                        (cred_row["credential_id"],),
+                    )
+                ]
+            credential = {
+                "credential_id": cred_row["credential_id"],
+                "process_id": cred_row["process_id"],
+                "credential_kind": cred_row["credential_kind"],
+                "inspections": inspections,
+            }
+        members_out.append(
+            {
+                "piece_id": m["piece_id"],
+                "workpiece_id": m["workpiece_id"],
+                "workpiece_code": wp["code"],
+                "gate_process_id": m["gate_process_id"],
+                "parent_piece_id": m["parent_piece_id"],
+                "depth": m["depth"],
+                "credential": credential,
+            }
+        )
+    return {
+        "snapshot_id": snap["snapshot_id"],
+        "order_id": snap["order_id"],
+        "action_id": snap["action_id"],
+        "root_piece_id": snap["root_piece_id"],
+        "root_workpiece_code": root_wp["code"],
+        "created_at": snap["created_at"],
+        "members": members_out,
+    }
+
+
+def get_shipment_trace(db_path: Path | str | None, order_id: int) -> dict[str, Any]:
+    """查一次实际发运：每个整件当时完整的父子组成，以及每个成员转运关口当时
+    生效的开工 / 复核凭据（含凭据快照引用的检验依据）。
+
+    本功能上线前的旧调拨单没有快照，snapshots 返回空列表，不补猜旧单。
+    """
+    conn = get_connection(db_path)
+    try:
+        order = _order_row(conn, order_id)
+        snaps = conn.execute(
+            "SELECT * FROM shipment_snapshot WHERE order_id = ? ORDER BY snapshot_id",
+            (order_id,),
+        ).fetchall()
+        return {
+            "order_id": order_id,
+            "order_status": order["status"],
+            "shipped_at": order["shipped_at"],
+            "snapshots": [_snapshot_detail(conn, s) for s in snaps],
+        }
+    finally:
+        conn.close()
+
+
+def find_gauge_impact(
+    db_path: Path | str | None, gauge_id: int, window_id: int
+) -> list[dict[str, Any]]:
+    """给定一条既有量具失准登记，返回哪些发运单的哪些整件和成员曾引用该量具
+    在该窗内的测量。
+
+    判定口径严格限定为**发运快照里各关口生效凭据所引用的测量**
+    （credential_inspection → inspection），因此事后拆换、补测、复核都不改变
+    查到的历史依据。只覆盖上线后留有快照的新发运。
+    """
+    conn = get_connection(db_path)
+    try:
+        window = conn.execute(
+            "SELECT * FROM gauge_window WHERE gauge_id = ? AND window_id = ?",
+            (gauge_id, window_id),
+        ).fetchone()
+        if window is None:
+            raise ServiceError(
+                404, f"量具 {gauge_id} 的失准窗口 {window_id} 不存在"
+            )
+        rows = conn.execute(
+            """
+            SELECT
+                o.order_id,
+                o.status AS order_status,
+                o.shipped_at,
+                s.snapshot_id,
+                s.root_piece_id,
+                m.piece_id AS member_piece_id,
+                m.workpiece_id AS member_workpiece_id,
+                m.gate_process_id,
+                sc.credential_id,
+                sc.credential_kind,
+                ci.item_id,
+                i.inspection_id,
+                i.measured_at,
+                i.reading
+            FROM shipment_snapshot s
+            JOIN transfer_order o ON o.order_id = s.order_id
+            JOIN shipment_snapshot_member m ON m.snapshot_id = s.snapshot_id
+            JOIN shipment_snapshot_credential sc
+                ON sc.snapshot_id = s.snapshot_id AND sc.piece_id = m.piece_id
+            JOIN credential_inspection ci ON ci.credential_id = sc.credential_id
+            JOIN inspection i ON i.inspection_id = ci.inspection_id
+            WHERE i.gauge_id = ?
+              AND i.measured_at >= ?
+              AND i.measured_at < ?
+            ORDER BY o.order_id, s.snapshot_id, m.depth, m.piece_id, ci.item_id
+            """,
+            (gauge_id, window["window_start"], window["window_end"]),
+        ).fetchall()
+        result: list[dict[str, Any]] = []
+        for r in rows:
+            root_wp = conn.execute(
+                """
+                SELECT w.code FROM workpiece w
+                JOIN piece p ON p.workpiece_id = w.workpiece_id
+                WHERE p.piece_id = ?
+                """,
+                (r["root_piece_id"],),
+            ).fetchone()
+            member_wp = conn.execute(
+                "SELECT code FROM workpiece WHERE workpiece_id = ?",
+                (r["member_workpiece_id"],),
+            ).fetchone()
+            result.append(
+                {
+                    "gauge_id": gauge_id,
+                    "window_id": window_id,
+                    "window_start": window["window_start"],
+                    "window_end": window["window_end"],
+                    "order_id": r["order_id"],
+                    "order_status": r["order_status"],
+                    "shipped_at": r["shipped_at"],
+                    "snapshot_id": r["snapshot_id"],
+                    "root_piece_id": r["root_piece_id"],
+                    "root_workpiece_code": root_wp["code"],
+                    "member_piece_id": r["member_piece_id"],
+                    "member_workpiece_id": r["member_workpiece_id"],
+                    "member_workpiece_code": member_wp["code"],
+                    "gate_process_id": r["gate_process_id"],
+                    "credential_id": r["credential_id"],
+                    "credential_kind": r["credential_kind"],
+                    "item_id": r["item_id"],
+                    "inspection_id": r["inspection_id"],
+                    "measured_at": r["measured_at"],
+                    "reading": r["reading"],
+                }
+            )
+        return result
+    finally:
+        conn.close()
