@@ -180,6 +180,11 @@ class ProcessStatusOut(BaseModel):
     can_start: bool
     blocking_reasons: list[str]
     open_quarantine: Optional[QuarantineOut]
+    # 是否已纳入班次派工：一旦纳入，原开工入口不再放行，必须凭当前派工开工
+    dispatch_required: bool = False
+    current_dispatch_id: Optional[int] = None
+    current_dispatch_status: Optional[str] = None
+    dispatch_suspended: bool = False
 
 
 # ---------- 工位交接 ----------
@@ -447,3 +452,198 @@ class GaugeImpactOut(BaseModel):
 
 # PieceCompositionOut 前向引用了稍后定义的 CompositionMemberOut，显式重建一次
 PieceCompositionOut.model_rebuild()
+
+
+# ------------------------------------------------------------------ 班次派工
+
+class MachineCreate(BaseModel):
+    code: str = Field(min_length=1, max_length=64)
+    name: str = Field(min_length=1, max_length=128)
+
+
+class MachineOut(BaseModel):
+    machine_id: int
+    code: str
+    name: str
+    created_at: str
+
+
+class FixtureCreate(BaseModel):
+    code: str = Field(min_length=1, max_length=64)
+    name: str = Field(min_length=1, max_length=128)
+
+
+class FixtureOut(BaseModel):
+    fixture_id: int
+    code: str
+    name: str
+    created_at: str
+
+
+class ResourceDowntimeCreate(BaseModel):
+    resource_type: str = Field(description="MACHINE 或 FIXTURE")
+    resource_id: int
+    window_start: str = Field(description="ISO-8601，左闭")
+    window_end: str = Field(description="ISO-8601，右开")
+    operator: Optional[str] = Field(default=None, max_length=64)
+    note: Optional[str] = None
+
+    @field_validator("resource_type")
+    @classmethod
+    def _check_type(cls, v: str) -> str:
+        v = v.strip().upper()
+        if v not in ("MACHINE", "FIXTURE"):
+            raise ValueError("resource_type 只能是 MACHINE 或 FIXTURE")
+        return v
+
+    @field_validator("window_start", "window_end")
+    @classmethod
+    def _strip(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("时间不能为空")
+        return v
+
+
+class ResourceDowntimeOut(BaseModel):
+    downtime_id: int
+    resource_type: str
+    resource_id: int
+    window_start: str
+    window_end: str
+    operator: Optional[str]
+    note: Optional[str]
+    created_at: str
+
+
+class DispatchOptionIn(BaseModel):
+    machine_id: int
+    fixture_id: int
+
+
+class ShiftDispatchSpec(BaseModel):
+    process_id: int
+    window_start: str = Field(description="允许加工的起止窗口，左闭")
+    window_end: str = Field(description="右开；预约须整体落在该窗口内")
+    duration_minutes: int = Field(gt=0, description="所需整分钟数")
+    options: list[DispatchOptionIn] = Field(
+        min_length=1, description="可用的「机器、夹具」组合，至少一种"
+    )
+
+    @field_validator("window_start", "window_end")
+    @classmethod
+    def _strip(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("时间不能为空")
+        return v
+
+
+class ShiftCreate(BaseModel):
+    code: str = Field(min_length=1, max_length=64)
+    operator: str = Field(min_length=1, max_length=64)
+    window_start: str
+    window_end: str
+    dispatches: list[ShiftDispatchSpec] = Field(min_length=1)
+
+    @field_validator("window_start", "window_end")
+    @classmethod
+    def _strip(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("时间不能为空")
+        return v
+
+
+class DispatchOptionOut(BaseModel):
+    machine_id: int
+    fixture_id: int
+
+
+class DispatchOut(BaseModel):
+    dispatch_id: int
+    shift_id: int
+    process_id: int
+    process_code: str
+    process_name: str
+    workpiece_id: int
+    workpiece_code: str
+    machine_id: int
+    machine_code: str
+    fixture_id: int
+    fixture_code: str
+    # 允许加工的窗口（请求值）
+    window_start: str
+    window_end: str
+    duration_minutes: int
+    # 实际预约占用的两项资源时段，左闭右开，整分钟起
+    reserved_start: str
+    reserved_end: str
+    status: str
+    is_current: bool
+    suspended: bool
+    started: bool
+    completed: bool
+    actual_start_at: Optional[str]
+    actual_end_at: Optional[str]
+    # 该工序当前实时状态（NOT_STARTED / STARTED / COMPLETED / QUARANTINED）
+    process_status: str
+    options: list[DispatchOptionOut]
+    created_at: str
+    updated_at: str
+
+
+class ShiftOut(BaseModel):
+    shift_id: int
+    code: str
+    operator: str
+    window_start: str
+    window_end: str
+    status: str
+    created_at: str
+    updated_at: str
+    # 该班次当前生效的派工（已换掉的旧派工不在其中，可在工序派工历史里查）
+    dispatches: list[DispatchOut]
+    has_suspended: bool
+    all_started_or_completed: bool
+
+
+class ShiftDispatchRequest(BaseModel):
+    operator: Optional[str] = Field(default=None, max_length=64)
+
+
+class ShiftDowntimeRequest(ResourceDowntimeCreate):
+    pass
+
+
+class RescheduleOut(BaseModel):
+    shift: ShiftOut
+    rescheduled: bool
+    suspended_dispatch_ids: list[int]
+    reason: Optional[str]
+    # 若请求同时登记了停用，这里返回该登记
+    downtime: Optional[ResourceDowntimeOut] = None
+
+
+class ShiftRescheduleRequest(BaseModel):
+    operator: Optional[str] = Field(default=None, max_length=64)
+    # 可选：在同一事务里登记一段停用，然后重排
+    resource_type: Optional[str] = None
+    resource_id: Optional[int] = None
+    window_start: Optional[str] = None
+    window_end: Optional[str] = None
+    note: Optional[str] = None
+
+    @field_validator("resource_type")
+    @classmethod
+    def _check_type(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        v = v.strip().upper()
+        if v not in ("MACHINE", "FIXTURE"):
+            raise ValueError("resource_type 只能是 MACHINE 或 FIXTURE")
+        return v
+
+
+class DispatchStartOut(ProcessStatusOut):
+    dispatch: DispatchOut

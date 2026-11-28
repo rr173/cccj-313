@@ -305,6 +305,146 @@ curl "$B/assembly-events?piece_id=2"
 比较的 UTC 字符串，因此窗口比较可直接用 SQL 字符串比较。业务错误返回
 `409`（规则不满足 / 冲突）、`404`（实体不存在）、`422`（输入校验 / 环 / 窗口反向）。
 
+## 6A. 班次派工
+
+同一班的几道机加工工序常争用同一台机器或同一副可周转夹具。班组长给出**不重叠的
+班次时段**与本班要做的**已有未开工工序**，服务为全班找出一份合法安排才发布；排
+不齐就整班不发布，绝不留下半份排班。
+
+### 6A.1 模型
+
+- **机器 machine / 夹具 fixture**：两种独占资源，可被预约。
+- **班次 shift**：`code`、`operator`、`window_start`、`window_end`（左闭右开）。
+- **派工 dispatch**：把一个**未开工**工序编入一个班次，记下
+  - 允许加工的窗口 `window_start/window_end`（预约须整体落在其中）、
+  - 所需整分钟数 `duration_minutes`、
+  - 可用的「机器、夹具」组合（`dispatch_option`，至少一种）。
+  排定后给出实际预约 `reserved_start/reserved_end`（整分钟起、左闭右开），在此时段
+  连续占用选定的机器与夹具两项资源。
+- **一道工序只能编入一个班次**：`dispatch.process_id` 上的部分唯一索引
+  `uq_current_dispatch_process`（`is_current = 1`）保证任一时刻至多一个当前派工。
+- 派工状态：`PLANNED`（已排、未开工）→ `STARTED` → `COMPLETED`；重排被换掉的旧派工
+  为 `REPLACED`（`is_current=0`，不再可执行），排不齐时冲突的未开工预约暂停为
+  `SUSPENDED`（`is_current=1`，留在本班，可再次重排）。
+
+### 6A.2 排班约束
+
+1. 任一资源（机器或夹具）都不得与**班内其他预约**、**其他班次仍在生效的预约**、
+   或**自身停用时段**重叠；预约从整分钟开始，区间左闭右开。
+2. 新安排不能从**过去**开始（以本次动作的当前时刻为下界）。
+3. 已开工 / 已完工的派工不能挪动，其原约定时段仍算已占；排班只避让。
+4. 不追求最优，返回任意一份合法安排；找不到覆盖全部未开工工序的安排时整班不发布。
+
+排班用带回溯的区间调度：按窗口结束早、时长长优先，逐工序尝试其全部「机器、夹具」
+组合与候选起点（窗口起点、相关停用边界、已占用区间右端、原预约起点），任一资源
+冲突即回退。
+
+### 6A.3 停机与重排（POST /shifts/{id}/reschedule）
+
+- 可同时在同一事务里**登记停用**（`resource_type` = `MACHINE` / `FIXTURE`、
+  `resource_id`、`window_start`、`window_end`）并重排；也可单独重排。
+- **未开工的预约可以互相挪动**：仍合法且没到期的原预约原样保留；需要挪动的换新。
+- 若能为**全部未开工工序**找到合法安排，就在同一事务里一起换成新安排（旧派工
+  `REPLACED`、新派工 `PLANNED`）。
+- 若找不到：**停用仍然生效**，与停用冲突的未开工预约暂停（`SUSPENDED`），其余原
+  预约保持不动。暂停项留在本班，班组长可用同一接口再次重排（成功即恢复 `PLANNED`）。
+- 已开工 / 已完工的派工即使撞上后来登记的停用也不改、不暂停，原约定时段仍算已占。
+
+### 6A.4 开工 / 完工与派工绑定
+
+- 工序一旦纳入过派工，**只能凭当前派工开工**（`POST /dispatches/{id}/start`），
+  原 `POST /processes/{id}/start` 一律 `409`；被换掉（`REPLACED`）或暂停
+  （`SUSPENDED`）的派工不能执行，也不能绕过派工。
+- 凭派工开工须同时满足：
+  1. 当前时刻落在预约时段 `[reserved_start, reserved_end)` 内；
+  2. 原有质量放行规则（检验合格、量具测量时有效、先决工序有效完工）；
+  3. 开工瞬间机器与夹具**均未停用**，且**未被其他实际开工工序占着**。
+- **实际占用**从开工成功起到**真实完工**才结束：不随预约到时、停机登记、质量隔离
+  或复核释放。后面的预约可排在前一道预计结束以后，但不到实际腾出资源就不能开工。
+- 完工走原 `POST /processes/{id}/complete`；若该工序凭当前派工开工，完工同一事务里
+  把派工置 `COMPLETED` 并记 `actual_end_at`。
+- **未纳入派工的工序仍按原方式操作**，行为不变。
+
+### 6A.5 查询
+
+- `GET /shifts/{id}`：每道工序的当前安排（组合、窗口、预约时段）及 `suspended` /
+  `started` / `completed` / `process_status`，另有 `has_suspended`、
+  `all_started_or_completed`。
+- `GET /processes/{id}/status` 增加 `dispatch_required`、`current_dispatch_id`、
+  `current_dispatch_status`、`dispatch_suspended`。
+- `GET /processes/{id}/dispatches`：该工序全部派工历史（含 `REPLACED` / `SUSPENDED`）。
+
+### 6A.6 并发与一致性
+
+所有派工写操作与既有写操作共用进程内 `_service_lock`，并在显式 `BEGIN IMMEDIATE`
+事务内完成「读全部相关状态 → 排班 / 校验 → 落库」，跨进程（两个终端）串行化。
+因此两进程同时重排 / 开工 / 登记质量变化时：不会用已失效预约开工、不会重复占用资源
+（部分唯一索引兜底）、也不会留下只发布了一部分的排班（整笔事务回滚）。
+
+### 6A.7 HTTP 接口（派工部分，前缀 `/api`）
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/machines` / `/fixtures` | 登记机器 / 夹具 |
+| GET | `/machines` / `/fixtures` | 列表 |
+| POST | `/resource-downtimes` | 登记机器 / 夹具停用时段（资源级事实，不改已有派工） |
+| GET | `/resource-downtimes?resource_type=&resource_id=` | 停用列表 |
+| POST | `/shifts` | 建班次并一次性排定全班；排不齐整班不发布 |
+| GET | `/shifts` / `/shifts/{id}` | 列表 / 详情（每道工序安排与暂停 / 开工 / 完工） |
+| POST | `/shifts/{id}/reschedule` | （可选同事务登记停用后）重排：能全排则换新，排不齐则暂停冲突项 |
+| GET | `/dispatches` / `/dispatches/{id}` | 派工列表 / 详情 |
+| GET | `/processes/{id}/dispatches` | 工序派工历史 |
+| POST | `/dispatches/{id}/start` | 凭当前派工开工（时段内 + 质量放行 + 两资源当时可用） |
+| GET | `/dispatches/{id}/events` | 该派工相关的状态事件 |
+
+### 6A.8 通过 HTTP 发布派工、停机后重排并实际开完工
+
+```bash
+B=http://127.0.0.1:8000/api
+J='content-type: application/json'
+
+# 0) 已有未开工工序（process_id 1、2）且已按原规则登记合格检验
+#    登记机器与夹具
+curl -X POST $B/machines -H "$J" -d '{"code":"MC-1","name":"车床"}'
+curl -X POST $B/fixtures -H "$J" -d '{"code":"FX-1","name":"可周转夹具"}'
+
+# 1) 发布派工：工序 1 在 09-12 窗口、60 分钟、只用 MC-1+FX-1；
+#    工序 2 在 11-15 窗口、60 分钟、同样组合
+curl -X POST $B/shifts -H "$J" -d '{
+  "code":"DAY-1","operator":"班长",
+  "window_start":"2026-12-01T09:00:00+00:00",
+  "window_end":"2026-12-01T17:00:00+00:00",
+  "dispatches":[
+    {"process_id":1,"window_start":"2026-12-01T09:00:00+00:00",
+     "window_end":"2026-12-01T12:00:00+00:00","duration_minutes":60,
+     "options":[{"machine_id":1,"fixture_id":1}]},
+    {"process_id":2,"window_start":"2026-12-01T11:00:00+00:00",
+     "window_end":"2026-12-01T15:00:00+00:00","duration_minutes":60,
+     "options":[{"machine_id":1,"fixture_id":1}]}]}'
+# 排不齐（例如两工序窗口重叠且只有同一组合）则返回 409，且不发布任何排班
+
+# 2) 班次详情：每道工序的组合、预约时段、是否暂停 / 开工 / 完工
+curl $B/shifts/1
+
+# 3) 机器 09-10 临时停机：登记停用并重排（同一事务）
+curl -X POST $B/shifts/1/reschedule -H "$J" -d '{
+  "operator":"班长","resource_type":"MACHINE","resource_id":1,
+  "window_start":"2026-12-01T09:00:00+00:00",
+  "window_end":"2026-12-01T10:00:00+00:00"}'
+# 能全排则 rescheduled=true 且预约挪到停用之后；
+# 排不下则 rescheduled=false，与停用冲突的未开工预约 suspended=true，
+# 其余保持原时段；停用两种情况下都已生效
+
+# 4) 在预约时段内凭当前派工开工（须满足质量放行、两资源当时可用）
+curl -X POST $B/dispatches/3/start -H "$J" -d '{"operator":"操作工"}'
+# 旧开工入口对被派工工序一律 409：
+curl -X POST $B/processes/1/start -H "$J" -d '{}'
+
+# 5) 完工仍走原接口；完工后派工置 COMPLETED 并记录真实结束时刻
+curl -X POST $B/processes/1/complete -H "$J" -d '{"operator":"操作工"}'
+curl $B/dispatches/3
+```
+
 ## 7. 运行与测试
 
 ```bash
@@ -322,14 +462,14 @@ pytest -q
 
 ```
 app/
-  database.py   # SQLite 连接、PRAGMA、建表 DDL（含实装树、装拆留痕、发运快照）
+  database.py   # SQLite 连接、PRAGMA、建表 DDL（含实装树、装拆留痕、发运快照、班次派工）
   schemas.py    # Pydantic 请求 / 响应模型
-  services.py   # 全部业务规则、隔离传导、工位交接、实装拆件、发运追溯、跨进程写锁
+  services.py   # 全部业务规则、隔离传导、工位交接、实装拆件、发运追溯、班次派工、跨进程写锁
   main.py       # FastAPI 路由与异常映射
-tests/          # 放行链路、隔离 / 复核、DAG 校验、并发、随机不变量、工位交接、实装拆件与追溯
+tests/          # 放行链路、隔离 / 复核、DAG 校验、并发、随机不变量、工位交接、实装拆件与追溯、班次派工
 run.sh          # 启动脚本
 ```
 
 所有建表 DDL 均为 `CREATE TABLE IF NOT EXISTS`，对既有库直接启动即幂等迁移，
-旧数据（工件、检验、凭据、工位、调拨单、落地记录）原样保留；发运追溯证据只对
-迁移后的新发运生成，不回填、不补猜旧单。
+旧数据（工件、检验、凭据、工位、调拨单、落地记录、班次派工）原样保留；发运追溯
+证据只对迁移后的新发运生成，不回填、不补猜旧单。

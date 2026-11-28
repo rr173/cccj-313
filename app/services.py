@@ -17,9 +17,10 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
-from collections import deque
+from collections import defaultdict, deque
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
@@ -57,6 +58,25 @@ def _immediate_tx(conn: sqlite3.Connection) -> Iterator[None]:
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+_now_override: Optional[str] = None
+
+
+@contextmanager
+def override_now(value: Optional[str]) -> Iterator[None]:
+    """测试 / 重排模拟用：临时固定“当前时刻”。仅供内部与测试使用。"""
+    global _now_override
+    previous = _now_override
+    _now_override = normalize_ts(value) if value is not None else None
+    try:
+        yield
+    finally:
+        _now_override = previous
+
+
+def current_ts() -> str:
+    return _now_override if _now_override is not None else now_iso()
 
 
 def normalize_ts(raw: str) -> str:
@@ -614,24 +634,57 @@ def _credential_detail(conn: sqlite3.Connection, credential_id: int) -> dict[str
     return result
 
 
+def _current_dispatch(conn: sqlite3.Connection, process_id: int) -> Optional[sqlite3.Row]:
+    """该工序当前生效的派工（is_current=1，至多一行）。"""
+    return conn.execute(
+        "SELECT * FROM dispatch WHERE process_id = ? AND is_current = 1",
+        (process_id,),
+    ).fetchone()
+
+
+def _any_dispatch_ever(conn: sqlite3.Connection, process_id: int) -> bool:
+    return (
+        conn.execute(
+            "SELECT 1 FROM dispatch WHERE process_id = ? LIMIT 1", (process_id,)
+        ).fetchone()
+        is not None
+    )
+
+
 def start_process(
     db_path: Path | str | None, process_id: int, operator: Optional[str]
 ) -> dict[str, Any]:
+    # 原开工入口：没有派工绑定的工序按原方式开工；已被纳入派工的工序必须凭
+    # 当前派工开工，见 start_dispatch。
     with _service_lock:
         conn = get_connection(db_path)
         try:
             proc = _get_process(conn, process_id)
-            state = _get_state(conn, process_id)
-            if state["status"] == "QUARANTINED":
-                raise ServiceError(409, "工序已隔离，须由质量员复核恢复后才能开工")
-            if state["status"] in ("STARTED", "COMPLETED"):
-                raise ServiceError(409, f"工序当前状态为 {state['status']}，不能重复开工")
-
-            issues = _basis_issues(conn, process_id)
-            if issues:
-                raise ServiceError(409, "不满足开工条件：" + "；".join(issues))
-
             with _immediate_tx(conn):
+                if _any_dispatch_ever(conn, process_id):
+                    current = _current_dispatch(conn, process_id)
+                    if current is None:
+                        raise ServiceError(
+                            409,
+                            "该工序已被派工纳入班次但当前无生效派工（已暂停或被换掉），"
+                            "不能从原开工入口执行；请由班组长重排后再凭派工开工",
+                        )
+                    raise ServiceError(
+                        409,
+                        f"该工序已纳入班次派工 {current['dispatch_id']}，"
+                        f"必须在预约时段内凭该派工开工（POST /api/dispatches/"
+                        f"{current['dispatch_id']}/start）",
+                    )
+                state = _get_state(conn, process_id)
+                if state["status"] == "QUARANTINED":
+                    raise ServiceError(409, "工序已隔离，须由质量员复核恢复后才能开工")
+                if state["status"] in ("STARTED", "COMPLETED"):
+                    raise ServiceError(409, f"工序当前状态为 {state['status']}，不能重复开工")
+
+                issues = _basis_issues(conn, process_id)
+                if issues:
+                    raise ServiceError(409, "不满足开工条件：" + "；".join(issues))
+
                 credential_id = _insert_credential(conn, process_id, "START", operator)
                 conn.execute(
                     "UPDATE process_state SET status = 'STARTED', quarantined_at = NULL, reason = NULL"
@@ -653,21 +706,24 @@ def complete_process(
         conn = get_connection(db_path)
         try:
             _get_process(conn, process_id)
-            state = _get_state(conn, process_id)
-            if state["status"] == "QUARANTINED":
-                raise ServiceError(409, "工序已隔离，不能完工；须先复核恢复为开工状态")
-            if state["status"] == "NOT_STARTED":
-                raise ServiceError(409, "工序尚未开工，不能完工")
-            if state["status"] == "COMPLETED":
-                raise ServiceError(409, "工序已完工，不能重复完工")
-
-            # 完工前防御性复核同一套规则（锁内无并发变更，正常应为空）
-            issues = _basis_issues(conn, process_id)
-            if issues:
-                raise ServiceError(409, "放行依据已失效，不能完工：" + "；".join(issues))
-
-            active = _active_credential(conn, process_id)
             with _immediate_tx(conn):
+                state = _get_state(conn, process_id)
+                if state["status"] == "QUARANTINED":
+                    raise ServiceError(409, "工序已隔离，不能完工；须先复核恢复为开工状态")
+                if state["status"] == "NOT_STARTED":
+                    raise ServiceError(409, "工序尚未开工，不能完工")
+                if state["status"] == "COMPLETED":
+                    raise ServiceError(409, "工序已完工，不能重复完工")
+
+                # 完工前防御性复核同一套规则
+                issues = _basis_issues(conn, process_id)
+                if issues:
+                    raise ServiceError(409, "放行依据已失效，不能完工：" + "；".join(issues))
+
+                active = _active_credential(conn, process_id)
+                # 若该工序凭当前派工开工，完工时一并结束实际占用（真实完工才释放）。
+                current = _current_dispatch(conn, process_id)
+                now = current_ts()
                 credential_id = _insert_credential(
                     conn, process_id, "COMPLETE", operator, basis_id=active["credential_id"]
                 )
@@ -675,13 +731,28 @@ def complete_process(
                     "UPDATE process_state SET status = 'COMPLETED' WHERE process_id = ?",
                     (process_id,),
                 )
-                _record_event(
-                    conn,
-                    process_id,
-                    "COMPLETE",
-                    f"完工凭据 credential_id={credential_id}，基于凭据 {active['credential_id']}",
-                    operator,
-                )
+                if current is not None and current["status"] == "STARTED":
+                    conn.execute(
+                        "UPDATE dispatch SET status = 'COMPLETED', actual_end_at = ?, updated_at = ?"
+                        " WHERE dispatch_id = ?",
+                        (now, now, current["dispatch_id"]),
+                    )
+                    _record_event(
+                        conn,
+                        process_id,
+                        "COMPLETE",
+                        f"完工凭据 credential_id={credential_id}，基于凭据 "
+                        f"{active['credential_id']}；结束派工 {current['dispatch_id']} 的实际占用",
+                        operator,
+                    )
+                else:
+                    _record_event(
+                        conn,
+                        process_id,
+                        "COMPLETE",
+                        f"完工凭据 credential_id={credential_id}，基于凭据 {active['credential_id']}",
+                        operator,
+                    )
             return get_process_status(db_path, process_id)
         finally:
             conn.close()
@@ -827,6 +898,27 @@ def get_process_status(db_path: Path | str | None, process_id: int) -> dict[str,
             result["blocking_reasons"] = (
                 [f"工序当前状态为 {state['status']}"] if state["status"] != "NOT_STARTED" else []
             )
+
+        # 班次派工绑定：纳入过派工的工序只能凭当前生效派工开工
+        current = _current_dispatch(conn, process_id)
+        ever = current is not None or _any_dispatch_ever(conn, process_id)
+        result["dispatch_required"] = ever
+        result["current_dispatch_id"] = current["dispatch_id"] if current is not None else None
+        result["current_dispatch_status"] = current["status"] if current is not None else None
+        result["dispatch_suspended"] = (
+            current is not None and current["status"] == "SUSPENDED"
+        )
+        if ever and state["status"] == "NOT_STARTED":
+            if current is None:
+                result["can_start"] = False
+                result["blocking_reasons"] = result["blocking_reasons"] + [
+                    "工序已被派工纳入班次但当前无生效派工（已暂停或被换掉），须先重排"
+                ]
+            else:
+                result["can_start"] = False
+                result["blocking_reasons"] = result["blocking_reasons"] + [
+                    f"工序已纳入班次派工 {current['dispatch_id']}，须在预约时段内凭该派工开工"
+                ]
         return result
     finally:
         conn.close()
@@ -2348,5 +2440,1107 @@ def find_gauge_impact(
                 }
             )
         return result
+    finally:
+        conn.close()
+
+
+# ================================================================ 班次派工
+#
+# 模型：
+# * 机器 machine、夹具 fixture 是两种独占资源；一次预约在 [reserved_start,
+#   reserved_end) 内连续占用一对「机器 + 夹具」。预约从整分钟开始，区间左闭右开。
+# * 派工 dispatch 把一个**未开工**工序编入一个班次，带上允许加工的窗口、所需
+#   整分钟数，以及该工序可用的「机器、夹具」组合（dispatch_option）。
+# * 一道工序在任一时刻至多有一个当前派工（部分唯一索引 uq_current_dispatch_process），
+#   因此同一道工序只能出现在一个班次里。
+# * 已开工 / 已完工的派工 actual_start_at / actual_end_at 记录真实占用：从开工成功
+#   起到真实完工才结束，不随预约到时、停机登记、质量隔离或复核释放。只有实际占用
+#   才阻止后面的预约开工；预约本身只需按预计时间互不重叠。
+#
+# 重排（reschedule）：
+# * 未开工的预约可以互相挪动；已开工 / 已完工的派工不能改，其原约定时段仍算已占
+#   （即使撞上后来登记的停用）。
+# * 若能为全部未开工工序找到合法安排，就在同一事务里一起换成新安排（旧派工
+#   REPLACED、新派工 PLANNED）；否则停用照常生效，与停用冲突的未开工预约暂停
+#   （SUSPENDED），其余原预约保持不动。暂停项留在本班，可再次重排。
+# * 新安排不能从过去开始（本次动作的当前时刻）。
+#
+# 并发：所有写操作共用进程内 _service_lock，并以显式 BEGIN IMMEDIATE 事务跨进程
+# 串行化。调度（读全部相关状态）与落库在同一写锁内完成，因此两个进程同时重排 /
+# 开工 / 登记质量变化时，不会用已失效预约开工、不会重复占用资源、也不会留下只发布
+# 了一部分的排班。
+
+
+ALLOWED_FIXTURE_STATUSES = ("PLANNED", "STARTED")
+
+
+def _add_minutes(raw: str, minutes: int) -> str:
+    return (datetime.fromisoformat(raw) + timedelta(minutes=minutes)).isoformat()
+
+
+def _parse_dt(raw: str) -> datetime:
+    return datetime.fromisoformat(raw)
+
+
+def _overlaps(a_start: str, a_end: str, b_start: str, b_end: str) -> bool:
+    """半开区间重叠判定。"""
+    return a_start < b_end and b_start < a_end
+
+
+def _get_machine(conn: sqlite3.Connection, machine_id: int) -> sqlite3.Row:
+    row = conn.execute(
+        "SELECT * FROM machine WHERE machine_id = ?", (machine_id,)
+    ).fetchone()
+    if row is None:
+        raise ServiceError(404, f"机器 {machine_id} 不存在")
+    return row
+
+
+def _get_fixture(conn: sqlite3.Connection, fixture_id: int) -> sqlite3.Row:
+    row = conn.execute(
+        "SELECT * FROM fixture WHERE fixture_id = ?", (fixture_id,)
+    ).fetchone()
+    if row is None:
+        raise ServiceError(404, f"夹具 {fixture_id} 不存在")
+    return row
+
+
+def _get_shift(conn: sqlite3.Connection, shift_id: int) -> sqlite3.Row:
+    row = conn.execute(
+        "SELECT * FROM shift WHERE shift_id = ?", (shift_id,)
+    ).fetchone()
+    if row is None:
+        raise ServiceError(404, f"班次 {shift_id} 不存在")
+    return row
+
+
+def _downtime_rows(
+    conn: sqlite3.Connection, resource_type: str, resource_id: int
+) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM resource_downtime WHERE resource_type = ? AND resource_id = ?"
+        " ORDER BY window_start",
+        (resource_type, resource_id),
+    ).fetchall()
+
+
+def _resource_blocked(
+    conn: sqlite3.Connection,
+    resource_type: str,
+    resource_id: int,
+    start: str,
+    end: str,
+) -> bool:
+    for d in _downtime_rows(conn, resource_type, resource_id):
+        if _overlaps(start, end, d["window_start"], d["window_end"]):
+            return True
+    return False
+
+
+# ---------------------------------------------------------------- registries
+
+def create_machine(db_path: Path | str | None, code: str, name: str) -> dict[str, Any]:
+    with _service_lock:
+        conn = get_connection(db_path)
+        try:
+            with _immediate_tx(conn):
+                try:
+                    cur = conn.execute(
+                        "INSERT INTO machine(code, name, created_at) VALUES (?, ?, ?)",
+                        (code, name, now_iso()),
+                    )
+                except sqlite3.IntegrityError as exc:
+                    raise ServiceError(409, f"机器编号 {code} 已存在") from exc
+                machine_id = cur.lastrowid
+            row = conn.execute(
+                "SELECT * FROM machine WHERE machine_id = ?", (machine_id,)
+            ).fetchone()
+            return dict(row)
+        finally:
+            conn.close()
+
+
+def list_machines(db_path: Path | str | None) -> list[dict[str, Any]]:
+    conn = get_connection(db_path)
+    try:
+        return [dict(r) for r in conn.execute("SELECT * FROM machine ORDER BY machine_id")]
+    finally:
+        conn.close()
+
+
+def create_fixture(db_path: Path | str | None, code: str, name: str) -> dict[str, Any]:
+    with _service_lock:
+        conn = get_connection(db_path)
+        try:
+            with _immediate_tx(conn):
+                try:
+                    cur = conn.execute(
+                        "INSERT INTO fixture(code, name, created_at) VALUES (?, ?, ?)",
+                        (code, name, now_iso()),
+                    )
+                except sqlite3.IntegrityError as exc:
+                    raise ServiceError(409, f"夹具编号 {code} 已存在") from exc
+                fixture_id = cur.lastrowid
+            row = conn.execute(
+                "SELECT * FROM fixture WHERE fixture_id = ?", (fixture_id,)
+            ).fetchone()
+            return dict(row)
+        finally:
+            conn.close()
+
+
+def list_fixtures(db_path: Path | str | None) -> list[dict[str, Any]]:
+    conn = get_connection(db_path)
+    try:
+        return [dict(r) for r in conn.execute("SELECT * FROM fixture ORDER BY fixture_id")]
+    finally:
+        conn.close()
+
+
+# ----------------------------------------------------------------- downtime
+
+def register_resource_downtime(
+    db_path: Path | str | None,
+    resource_type: str,
+    resource_id: int,
+    window_start_raw: str,
+    window_end_raw: str,
+    operator: Optional[str],
+    note: Optional[str],
+) -> dict[str, Any]:
+    """登记机器 / 夹具停用时段；只登记资源级事实，不改动已有派工。"""
+    window_start = normalize_ts(window_start_raw)
+    window_end = normalize_ts(window_end_raw)
+    if not window_start < window_end:
+        raise ServiceError(422, "停用时段要求 window_start < window_end（半开 [start, end)）")
+    if resource_type not in ("MACHINE", "FIXTURE"):
+        raise ServiceError(422, "resource_type 只能是 MACHINE 或 FIXTURE")
+
+    with _service_lock:
+        conn = get_connection(db_path)
+        try:
+            if resource_type == "MACHINE":
+                _get_machine(conn, resource_id)
+            else:
+                _get_fixture(conn, resource_id)
+            with _immediate_tx(conn):
+                cur = conn.execute(
+                    """
+                    INSERT INTO resource_downtime(resource_type, resource_id,
+                        window_start, window_end, operator, note, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (resource_type, resource_id, window_start, window_end,
+                     operator, note, now_iso()),
+                )
+                downtime_id = cur.lastrowid
+            row = conn.execute(
+                "SELECT * FROM resource_downtime WHERE downtime_id = ?", (downtime_id,)
+            ).fetchone()
+            return dict(row)
+        finally:
+            conn.close()
+
+
+def list_resource_downtimes(
+    db_path: Path | str | None,
+    resource_type: Optional[str] = None,
+    resource_id: Optional[int] = None,
+) -> list[dict[str, Any]]:
+    conn = get_connection(db_path)
+    try:
+        sql = "SELECT * FROM resource_downtime"
+        params: list[Any] = []
+        where: list[str] = []
+        if resource_type is not None:
+            where.append("resource_type = ?")
+            params.append(resource_type)
+        if resource_id is not None:
+            where.append("resource_id = ?")
+            params.append(resource_id)
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY downtime_id"
+        return [dict(r) for r in conn.execute(sql, params)]
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------------- scheduling engine
+#
+# 排班是典型的区间 + 资源组合问题。这里不追求最优，只要求找到任意一份合法安排；
+# 找不到就整体不发布。由于数据规模（一个班次的工序数）很小，采用带回溯的贪心
+# 搜索：按「窗口结束最早优先」排序，逐个工序尝试其全部「机器、夹具」组合及候选
+# 起点（在窗口内、整分钟、且避开已选排班的预计占用与资源停用）。
+
+
+@dataclass
+class _Demand:
+    """一次待排的工序需求（一次派工尝试）。"""
+    process_id: int
+    window_start: str
+    window_end: str
+    duration_minutes: int
+    options: list[tuple[int, int]] = field(default_factory=list)
+    # 保留原派工 id（重排时为原 dispatch_id；首次排班为 None），用于尽量保留
+    # 已合法的原预约。
+    dispatch_id: Optional[int] = None
+    # 重排时原派工的预约（用于优先原地保留）；首次排班为 None。
+    preferred: Optional[tuple[int, int, str]] = None  # (machine, fixture, start)
+
+
+@dataclass
+class _Placement:
+    demand: _Demand
+    machine_id: int
+    fixture_id: int
+    start: str
+    end: str
+
+
+def _ceil_minute(dt: datetime) -> datetime:
+    if dt.second or dt.microsecond:
+        return dt.replace(second=0, microsecond=0) + timedelta(minutes=1)
+    return dt.replace(second=0, microsecond=0)
+
+
+def _candidate_starts(
+    demand: _Demand,
+    earliest: datetime,
+    occupied: dict[tuple[str, int], list[tuple[str, str]]],
+) -> list[datetime]:
+    """在加工窗口内、整分钟的候选起点。
+
+    完备的候选集只要包含：窗口起点、每条相关资源停用时段的右端、以及当前已
+    占用区间的右端（贴着既有占用之后安排）。任一可行整数分钟排班都可用这些
+    事件点平移得到，因此回溯在这些点中搜索即可找到合法安排（规模很小）。
+    """
+    ws = max(_parse_dt(demand.window_start), earliest)
+    ws = _ceil_minute(ws)
+    we = _parse_dt(demand.window_end)
+    dur = timedelta(minutes=demand.duration_minutes)
+    points: set[datetime] = {ws}
+    resource_keys = {("MACHINE", m) for m, _ in demand.options} | {
+        ("FIXTURE", f) for _, f in demand.options
+    }
+    for key in resource_keys:
+        for (_, oe) in occupied.get(key, []):
+            points.add(_parse_dt(oe))
+        for d in _downtime_cache.get(key, []):
+            points.add(_parse_dt(d["window_end"]))
+            points.add(_parse_dt(d["window_start"]))
+    starts: list[datetime] = []
+    for s in sorted(points):
+        s = _ceil_minute(s)
+        if s < ws or s + dur > we:
+            continue
+        if s not in starts:
+            starts.append(s)
+    # 重排时若原预约起点仍合法（在窗口内、没到期），优先原样保留。
+    if demand.preferred is not None:
+        pref = _parse_dt(demand.preferred[2])
+        if pref >= ws and pref + dur <= we:
+            starts = [pref] + [s for s in starts if s != pref]
+    return starts
+
+
+# 排班期间缓存停用时段（按资源），避免重复查询；由 build_schedule 填充 / 清理。
+_downtime_cache: dict[tuple[str, int], list[sqlite3.Row]] = {}
+
+
+def _load_downtime_cache(conn: sqlite3.Connection, demands: list[_Demand]) -> None:
+    _downtime_cache.clear()
+    keys: set[tuple[str, int]] = set()
+    for d in demands:
+        for m, f in d.options:
+            keys.add(("MACHINE", m))
+            keys.add(("FIXTURE", f))
+    for rtype, rid in keys:
+        _downtime_cache[(rtype, rid)] = _downtime_rows(conn, rtype, rid)
+
+
+def _clear_downtime_cache() -> None:
+    _downtime_cache.clear()
+
+
+def build_schedule(
+    demands: list[_Demand],
+    fixed: list[_Placement],
+    earliest: datetime,
+) -> Optional[list[_Placement]]:
+    """为全部 demands 找到一份合法安排，或返回 None（第一次排不齐就不发布）。
+
+    * fixed 是已开工 / 已完工、不能挪动的实际占用，以固定区间参与资源冲突。
+    * 每个工序只能选其 options 内的「机器、夹具」组合。
+    * 任一资源（机器或夹具）都不得与 fixed、已选 placements、或自身停用时段重叠。
+    """
+    # 资源占用按 (类型, id) 聚合区间
+    occupied: dict[tuple[str, int], list[tuple[str, str]]] = defaultdict(list)
+    for p in fixed:
+        occupied[("MACHINE", p.machine_id)].append((p.start, p.end))
+        occupied[("FIXTURE", p.fixture_id)].append((p.start, p.end))
+
+    def free(rtype: str, rid: int, s: str, e: str) -> bool:
+        for (os_, oe) in occupied[(rtype, rid)]:
+            if _overlaps(s, e, os_, oe):
+                return False
+        for d in _downtime_cache.get((rtype, rid), []):
+            if _overlaps(s, e, d["window_start"], d["window_end"]):
+                return False
+        return True
+
+    # 排序启发：窗口结束最早、时长最长优先，受限的组合先排。
+    ordered = sorted(
+        demands,
+        key=lambda d: (d.window_end, -d.duration_minutes, d.process_id),
+    )
+    placed: list[_Placement] = []
+
+    def backtrack(idx: int) -> bool:
+        if idx == len(ordered):
+            return True
+        d = ordered[idx]
+        # 重排时优先保留原组合
+        opts = list(d.options)
+        if d.preferred is not None and (d.preferred[0], d.preferred[1]) in opts:
+            pref = (d.preferred[0], d.preferred[1])
+            opts.remove(pref)
+            opts.insert(0, pref)
+        for s in _candidate_starts(d, earliest, occupied):
+            e = _add_minutes(s.isoformat(), d.duration_minutes)
+            if _parse_dt(e) > _parse_dt(d.window_end):
+                continue
+            s_iso = s.isoformat()
+            for (m, f) in opts:
+                if not free("MACHINE", m, s_iso, e):
+                    continue
+                if not free("FIXTURE", f, s_iso, e):
+                    continue
+                placement = _Placement(d, m, f, s_iso, e)
+                occ_m = ("MACHINE", m)
+                occ_f = ("FIXTURE", f)
+                occupied[occ_m].append((s_iso, e))
+                occupied[occ_f].append((s_iso, e))
+                placed.append(placement)
+                if backtrack(idx + 1):
+                    return True
+                placed.pop()
+                occupied[occ_m].pop()
+                occupied[occ_f].pop()
+        return False
+
+    if backtrack(0):
+        return placed
+    return None
+
+
+# ------------------------------------------------------------ shift creation
+
+def _process_dispatch_dict(conn: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
+    proc = conn.execute(
+        "SELECT * FROM process WHERE process_id = ?", (row["process_id"],)
+    ).fetchone()
+    wp = conn.execute(
+        "SELECT code FROM workpiece WHERE workpiece_id = ?", (proc["workpiece_id"],)
+    ).fetchone()
+    machine = conn.execute(
+        "SELECT code FROM machine WHERE machine_id = ?", (row["machine_id"],)
+    ).fetchone()
+    fixture = conn.execute(
+        "SELECT code FROM fixture WHERE fixture_id = ?", (row["fixture_id"],)
+    ).fetchone()
+    options = [
+        {"machine_id": r["machine_id"], "fixture_id": r["fixture_id"]}
+        for r in conn.execute(
+            "SELECT machine_id, fixture_id FROM dispatch_option WHERE dispatch_id = ?"
+            " ORDER BY machine_id, fixture_id",
+            (row["dispatch_id"],),
+        )
+    ]
+    state = conn.execute(
+        "SELECT status FROM process_state WHERE process_id = ?", (row["process_id"],)
+    ).fetchone()
+    status = row["status"]
+    return {
+        "dispatch_id": row["dispatch_id"],
+        "shift_id": row["shift_id"],
+        "process_id": row["process_id"],
+        "process_code": proc["code"],
+        "process_name": proc["name"],
+        "workpiece_id": proc["workpiece_id"],
+        "workpiece_code": wp["code"],
+        "machine_id": row["machine_id"],
+        "machine_code": machine["code"],
+        "fixture_id": row["fixture_id"],
+        "fixture_code": fixture["code"],
+        "window_start": row["window_start"],
+        "window_end": row["window_end"],
+        "duration_minutes": row["duration_minutes"],
+        "reserved_start": row["reserved_start"],
+        "reserved_end": row["reserved_end"],
+        "status": status,
+        "is_current": bool(row["is_current"]),
+        "suspended": status == "SUSPENDED",
+        "started": status in ("STARTED", "COMPLETED"),
+        "completed": status == "COMPLETED",
+        "actual_start_at": row["actual_start_at"],
+        "actual_end_at": row["actual_end_at"],
+        "process_status": state["status"] if state is not None else "NOT_STARTED",
+        "options": options,
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def _shift_dict(conn: sqlite3.Connection, shift: sqlite3.Row) -> dict[str, Any]:
+    rows = conn.execute(
+        "SELECT * FROM dispatch WHERE shift_id = ? AND is_current = 1"
+        " ORDER BY reserved_start, dispatch_id",
+        (shift["shift_id"],),
+    ).fetchall()
+    dispatches = [_process_dispatch_dict(conn, r) for r in rows]
+    return {
+        "shift_id": shift["shift_id"],
+        "code": shift["code"],
+        "operator": shift["operator"],
+        "window_start": shift["window_start"],
+        "window_end": shift["window_end"],
+        "status": shift["status"],
+        "created_at": shift["created_at"],
+        "updated_at": shift["updated_at"],
+        "dispatches": dispatches,
+        "has_suspended": any(d["suspended"] for d in dispatches),
+        "all_started_or_completed": bool(dispatches)
+        and all(d["started"] for d in dispatches),
+    }
+
+
+def _existing_fixed_placements(
+    conn: sqlite3.Connection, exclude_dispatch_ids: set[int]
+) -> list[_Placement]:
+    """当前已开工 / 已完工的派工，其原约定时段仍算已占，参与冲突判定。
+
+    即使这些预约遇到后来登记的停用，也不会被挪动；排班只避让它们的区间。
+    """
+    rows = conn.execute(
+        "SELECT * FROM dispatch WHERE is_current = 1 AND status IN ('STARTED', 'COMPLETED')"
+    ).fetchall()
+    placements: list[_Placement] = []
+    for r in rows:
+        if r["dispatch_id"] in exclude_dispatch_ids:
+            continue
+        d = _Demand(
+            process_id=r["process_id"],
+            window_start=r["reserved_start"],
+            window_end=r["reserved_end"],
+            duration_minutes=r["duration_minutes"],
+            options=[(r["machine_id"], r["fixture_id"])],
+            dispatch_id=r["dispatch_id"],
+        )
+        placements.append(
+            _Placement(d, r["machine_id"], r["fixture_id"], r["reserved_start"], r["reserved_end"])
+        )
+    return placements
+
+
+def _planned_other_shifts(
+    conn: sqlite3.Connection, shift_id: int, exclude_dispatch_ids: set[int]
+) -> list[_Placement]:
+    """其他班次里未开工、也未暂停的当前预约，同样按其预计时段参与资源避让。
+
+    重排只改本班次；但不同班次的预约共享同一资源，因此新安排不能撞上其他班次
+    仍在生效的预约。
+    """
+    rows = conn.execute(
+        "SELECT * FROM dispatch WHERE is_current = 1 AND shift_id <> ?"
+        " AND status IN ('PLANNED')",
+        (shift_id,),
+    ).fetchall()
+    placements: list[_Placement] = []
+    for r in rows:
+        if r["dispatch_id"] in exclude_dispatch_ids:
+            continue
+        d = _Demand(
+            process_id=r["process_id"],
+            window_start=r["reserved_start"],
+            window_end=r["reserved_end"],
+            duration_minutes=r["duration_minutes"],
+            options=[(r["machine_id"], r["fixture_id"])],
+            dispatch_id=r["dispatch_id"],
+        )
+        placements.append(
+            _Placement(d, r["machine_id"], r["fixture_id"], r["reserved_start"], r["reserved_end"])
+        )
+    return placements
+
+
+def _validate_shift_spec(
+    conn: sqlite3.Connection, spec_dispatch: dict[str, Any], seen_processes: set[int]
+) -> None:
+    pid = spec_dispatch["process_id"]
+    if pid in seen_processes:
+        raise ServiceError(422, f"同一工序 {pid} 在一次班次请求里重复出现；一道工序只能编入一个班次")
+    seen_processes.add(pid)
+    proc = _get_process(conn, pid)
+    state = _get_state(conn, pid)
+    if state["status"] != "NOT_STARTED":
+        raise ServiceError(
+            409,
+            f"工序 {proc['code']}（id={pid}）当前状态为 {state['status']}，"
+            f"只有未开工的工序可以编入班次",
+        )
+    # 已纳入其他派工的工序不能再编入（每道工序至多一个当前派工）
+    if _any_dispatch_ever(conn, pid):
+        raise ServiceError(
+            409, f"工序 {proc['code']}（id={pid}）已经纳入过派工，不能重复编入新的班次"
+        )
+    ws = normalize_ts(spec_dispatch["window_start"])
+    we = normalize_ts(spec_dispatch["window_end"])
+    if not ws < we:
+        raise ServiceError(422, f"工序 {proc['code']} 的加工窗口要求 window_start < window_end")
+    if spec_dispatch["duration_minutes"] <= 0:
+        raise ServiceError(422, f"工序 {proc['code']} 的所需分钟数必须为正整数")
+    if not spec_dispatch["options"]:
+        raise ServiceError(422, f"工序 {proc['code']} 至少需要一种「机器、夹具」组合")
+    seen_opts: set[tuple[int, int]] = set()
+    for opt in spec_dispatch["options"]:
+        key = (opt["machine_id"], opt["fixture_id"])
+        if key in seen_opts:
+            raise ServiceError(422, f"工序 {proc['code']} 的「机器、夹具」组合重复")
+        seen_opts.add(key)
+        _get_machine(conn, opt["machine_id"])
+        _get_fixture(conn, opt["fixture_id"])
+
+
+def create_shift(
+    db_path: Path | str | None, payload: dict[str, Any]
+) -> dict[str, Any]:
+    """创建班次并一次性排定全班：为每道工序选定组合与预约时段。
+
+    所有工序都要求是未开工工序；任一工序找不到合法位置则整个请求失败，不发布
+    半份排班。
+    """
+    shift_ws = normalize_ts(payload["window_start"])
+    shift_we = normalize_ts(payload["window_end"])
+    if not shift_ws < shift_we:
+        raise ServiceError(422, "班次时段要求 window_start < window_end")
+
+    specs = payload["dispatches"]
+    with _service_lock:
+        conn = get_connection(db_path)
+        try:
+            with _immediate_tx(conn):
+                if conn.execute(
+                    "SELECT 1 FROM shift WHERE code = ?", (payload["code"],)
+                ).fetchone() is not None:
+                    raise ServiceError(409, f"班次编号 {payload['code']} 已存在")
+
+                seen_processes: set[int] = set()
+                demands: list[_Demand] = []
+                for spec in specs:
+                    _validate_shift_spec(conn, spec, seen_processes)
+                    ws = normalize_ts(spec["window_start"])
+                    we = normalize_ts(spec["window_end"])
+                    # 加工窗口须落在班次时段内
+                    if ws < shift_ws or we > shift_we:
+                        raise ServiceError(
+                            409,
+                            f"工序 {spec['process_id']} 的加工窗口 [{ws}, {we}) "
+                            f"超出班次时段 [{shift_ws}, {shift_we})",
+                        )
+                    if _parse_dt(_add_minutes(ws, spec["duration_minutes"])) > _parse_dt(we):
+                        raise ServiceError(
+                            409,
+                            f"工序 {spec['process_id']} 所需 {spec['duration_minutes']} 分钟"
+                            f"放不进加工窗口 [{ws}, {we})",
+                        )
+                    demands.append(
+                        _Demand(
+                            process_id=spec["process_id"],
+                            window_start=ws,
+                            window_end=we,
+                            duration_minutes=spec["duration_minutes"],
+                            options=[
+                                (o["machine_id"], o["fixture_id"]) for o in spec["options"]
+                            ],
+                        )
+                    )
+
+                _load_downtime_cache(conn, demands)
+                try:
+                    # 首次排班：只有其他班次已开工 / 生效的预约作为固定占用
+                    fixed = _existing_fixed_placements(conn, set())
+                    fixed += _planned_other_shifts(conn, -1, set())
+                    earliest = _ceil_minute(_parse_dt(current_ts()))
+                    schedule = build_schedule(demands, fixed, earliest)
+                finally:
+                    _clear_downtime_cache()
+
+                if schedule is None:
+                    raise ServiceError(
+                        409,
+                        "本班次无法排出一份覆盖全部工序的合法安排，未发布任何排班",
+                    )
+
+                now = now_iso()
+                cur = conn.execute(
+                    """
+                    INSERT INTO shift(code, operator, window_start, window_end,
+                                      status, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, 'PUBLISHED', ?, ?)
+                    """,
+                    (payload["code"], payload["operator"], shift_ws, shift_we, now, now),
+                )
+                shift_id = cur.lastrowid
+                for placement in schedule:
+                    _insert_dispatch(conn, shift_id, placement, now)
+            shift = _get_shift(conn, shift_id)
+            return _shift_dict(conn, shift)
+        finally:
+            conn.close()
+
+
+def _insert_dispatch(
+    conn: sqlite3.Connection,
+    shift_id: int,
+    placement: _Placement,
+    now: str,
+    options: Optional[list[tuple[int, int]]] = None,
+) -> int:
+    d = placement.demand
+    cur = conn.execute(
+        """
+        INSERT INTO dispatch(shift_id, process_id, machine_id, fixture_id,
+            window_start, window_end, duration_minutes, reserved_start, reserved_end,
+            status, is_current, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'PLANNED', 1, ?, ?)
+        """,
+        (
+            shift_id,
+            d.process_id,
+            placement.machine_id,
+            placement.fixture_id,
+            d.window_start,
+            d.window_end,
+            d.duration_minutes,
+            placement.start,
+            placement.end,
+            now,
+            now,
+        ),
+    )
+    dispatch_id = cur.lastrowid
+    for m, f in (options if options is not None else d.options):
+        conn.execute(
+            "INSERT INTO dispatch_option(dispatch_id, machine_id, fixture_id) VALUES (?, ?, ?)",
+            (dispatch_id, m, f),
+        )
+    return dispatch_id
+
+
+# -------------------------------------------------------------- queries
+
+def get_shift(db_path: Path | str | None, shift_id: int) -> dict[str, Any]:
+    conn = get_connection(db_path)
+    try:
+        shift = _get_shift(conn, shift_id)
+        return _shift_dict(conn, shift)
+    finally:
+        conn.close()
+
+
+def list_shifts(db_path: Path | str | None) -> list[dict[str, Any]]:
+    conn = get_connection(db_path)
+    try:
+        return [
+            _shift_dict(conn, r)
+            for r in conn.execute("SELECT * FROM shift ORDER BY shift_id")
+        ]
+    finally:
+        conn.close()
+
+
+def list_dispatches(db_path: Path | str | None, shift_id: Optional[int] = None) -> list[dict[str, Any]]:
+    conn = get_connection(db_path)
+    try:
+        if shift_id is not None:
+            _get_shift(conn, shift_id)
+            rows = conn.execute(
+                "SELECT * FROM dispatch WHERE shift_id = ? ORDER BY dispatch_id",
+                (shift_id,),
+            ).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM dispatch ORDER BY dispatch_id").fetchall()
+        return [_process_dispatch_dict(conn, r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_dispatch(db_path: Path | str | None, dispatch_id: int) -> dict[str, Any]:
+    conn = get_connection(db_path)
+    try:
+        row = conn.execute(
+            "SELECT * FROM dispatch WHERE dispatch_id = ?", (dispatch_id,)
+        ).fetchone()
+        if row is None:
+            raise ServiceError(404, f"派工 {dispatch_id} 不存在")
+        return _process_dispatch_dict(conn, row)
+    finally:
+        conn.close()
+
+
+def get_process_dispatches(db_path: Path | str | None, process_id: int) -> list[dict[str, Any]]:
+    conn = get_connection(db_path)
+    try:
+        _get_process(conn, process_id)
+        rows = conn.execute(
+            "SELECT * FROM dispatch WHERE process_id = ? ORDER BY dispatch_id",
+            (process_id,),
+        ).fetchall()
+        return [_process_dispatch_dict(conn, r) for r in rows]
+    finally:
+        conn.close()
+
+
+# ------------------------------------------------------------- reschedule
+
+def _shift_current_dispatches(conn: sqlite3.Connection, shift_id: int) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM dispatch WHERE shift_id = ? AND is_current = 1 ORDER BY dispatch_id",
+        (shift_id,),
+    ).fetchall()
+
+
+def _dispatch_options(conn: sqlite3.Connection, dispatch_id: int) -> list[tuple[int, int]]:
+    return [
+        (r["machine_id"], r["fixture_id"])
+        for r in conn.execute(
+            "SELECT machine_id, fixture_id FROM dispatch_option WHERE dispatch_id = ?"
+            " ORDER BY machine_id, fixture_id",
+            (dispatch_id,),
+        )
+    ]
+
+
+def _demand_from_dispatch(conn: sqlite3.Connection, row: sqlite3.Row) -> _Demand:
+    return _Demand(
+        process_id=row["process_id"],
+        window_start=row["window_start"],
+        window_end=row["window_end"],
+        duration_minutes=row["duration_minutes"],
+        options=_dispatch_options(conn, row["dispatch_id"]),
+        dispatch_id=row["dispatch_id"],
+        preferred=(row["machine_id"], row["fixture_id"], row["reserved_start"]),
+    )
+
+
+def reschedule_shift(
+    db_path: Path | str | None,
+    shift_id: int,
+    operator: Optional[str] = None,
+    downtime: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """登记（可选）停用并重排一个班次。
+
+    * 未开工的预约可以互相挪动；已开工 / 已完工的派工不能改，其原约定时段仍算
+      已占（即使撞上刚登记的停用）。
+    * 若某道未开工工序与停用冲突，但由于其它资源组合 / 其它时段仍可合法落位，
+      则为全部未开工工序寻找一份完整安排。
+    * 找得到：在同一事务里一起换成新安排（旧派工 REPLACED，新派工 PLANNED）。
+    * 找不到：停用仍然生效，与停用冲突的未开工预约暂停（SUSPENDED），其余原
+      预约保持不动。
+    * 新安排不能从过去开始。
+    """
+    with _service_lock:
+        conn = get_connection(db_path)
+        try:
+            with _immediate_tx(conn):
+                shift = _get_shift(conn, shift_id)
+
+                # 可选：同事务登记停用（与重排原子）
+                downtime_row: Optional[dict[str, Any]] = None
+                if downtime is not None:
+                    rtype = downtime["resource_type"]
+                    rid = downtime["resource_id"]
+                    if rtype == "MACHINE":
+                        _get_machine(conn, rid)
+                    elif rtype == "FIXTURE":
+                        _get_fixture(conn, rid)
+                    else:
+                        raise ServiceError(422, "resource_type 只能是 MACHINE 或 FIXTURE")
+                    dws = normalize_ts(downtime["window_start"])
+                    dwe = normalize_ts(downtime["window_end"])
+                    if not dws < dwe:
+                        raise ServiceError(422, "停用时段要求 window_start < window_end")
+                    cur = conn.execute(
+                        """
+                        INSERT INTO resource_downtime(resource_type, resource_id,
+                            window_start, window_end, operator, note, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (rtype, rid, dws, dwe, operator, downtime.get("note"), now_iso()),
+                    )
+                    dt_id = cur.lastrowid
+                    downtime_row = dict(
+                        conn.execute(
+                            "SELECT * FROM resource_downtime WHERE downtime_id = ?", (dt_id,)
+                        ).fetchone()
+                    )
+
+                rows = _shift_current_dispatches(conn, shift_id)
+                now_ts = current_ts()
+                earliest = _ceil_minute(_parse_dt(now_ts))
+
+                # 可重排的派工：状态为 PLANNED（未开工）或 SUSPENDED（暂停待重排）。
+                # 已开工 / 已完工的派工不能改，原约定时段仍算已占。
+                movable: list[_Demand] = []
+                movable_rows: list[sqlite3.Row] = []
+                for r in rows:
+                    if r["status"] not in ("PLANNED", "SUSPENDED"):
+                        continue
+                    movable.append(_demand_from_dispatch(conn, r))
+                    movable_rows.append(r)
+
+                # 固定占用：已开工 / 已完工的派工（原约定时段仍算已占，即使撞停用）
+                # + 其他班次仍在生效的预约。
+                fixed = _existing_fixed_placements(conn, set())
+                fixed += _planned_other_shifts(
+                    conn, shift_id, {r["dispatch_id"] for r in rows}
+                )
+
+                _load_downtime_cache(conn, movable)
+                try:
+                    schedule = build_schedule(movable, fixed, earliest) if movable else []
+                finally:
+                    _clear_downtime_cache()
+
+                suspended_ids: list[int] = []
+                rescheduled = False
+                reason: Optional[str] = None
+
+                if schedule is not None:
+                    # 找到覆盖全部未开工工序的安排：在同一事务内一起换新。
+                    # “仍合法且没到期”的原预约可原样保留，只把需要挪动的换掉。
+                    by_process: dict[int, _Placement] = {
+                        p.demand.process_id: p for p in schedule
+                    }
+                    now = now_iso()
+                    for r in movable_rows:
+                        old_id = r["dispatch_id"]
+                        placement = by_process[r["process_id"]]
+                        same = (
+                            placement.machine_id == r["machine_id"]
+                            and placement.fixture_id == r["fixture_id"]
+                            and placement.start == r["reserved_start"]
+                            and placement.end == r["reserved_end"]
+                        )
+                        if same and r["status"] == "PLANNED":
+                            # 原预约仍然合法且没到期：保留不动
+                            continue
+                        # 旧派工失效（被换掉 / 从暂停恢复），不再可执行
+                        conn.execute(
+                            "UPDATE dispatch SET status = 'REPLACED', is_current = 0,"
+                            " updated_at = ? WHERE dispatch_id = ?",
+                            (now, old_id),
+                        )
+                        _insert_dispatch(
+                            conn, shift_id, placement, now,
+                            options=_dispatch_options(conn, old_id),
+                        )
+                    conn.execute(
+                        "UPDATE shift SET updated_at = ? WHERE shift_id = ?", (now, shift_id)
+                    )
+                    rescheduled = True
+                else:
+                    # 排不齐：停用照常生效；只把与停用冲突的未开工预约暂停，其余原
+                    # 预约保持不动（不挪动、不改组合）。
+                    now = now_iso()
+                    for r in movable_rows:
+                        if _dispatch_conflicts_downtime(conn, r):
+                            conn.execute(
+                                "UPDATE dispatch SET status = 'SUSPENDED', is_current = 1,"
+                                " updated_at = ? WHERE dispatch_id = ?",
+                                (now, r["dispatch_id"]),
+                            )
+                            suspended_ids.append(r["dispatch_id"])
+                    conn.execute(
+                        "UPDATE shift SET updated_at = ? WHERE shift_id = ?", (now, shift_id)
+                    )
+                    reason = (
+                        "无法为本班次全部未开工工序找到合法安排；停用已生效，与停用冲突的"
+                        "未开工预约已暂停，其余预约保持不动"
+                    )
+            shift = _get_shift(conn, shift_id)
+            return {
+                "shift": _shift_dict(conn, shift),
+                "rescheduled": rescheduled,
+                "suspended_dispatch_ids": suspended_ids,
+                "reason": reason,
+                "downtime": downtime_row,
+            }
+        finally:
+            conn.close()
+
+
+def _dispatch_conflicts_downtime(
+    conn: sqlite3.Connection, dispatch_row: sqlite3.Row
+) -> bool:
+    """该派工当前预约是否与它涉及任一资源的停用时段冲突。"""
+    s = dispatch_row["reserved_start"]
+    e = dispatch_row["reserved_end"]
+    if _resource_blocked(conn, "MACHINE", dispatch_row["machine_id"], s, e):
+        return True
+    if _resource_blocked(conn, "FIXTURE", dispatch_row["fixture_id"], s, e):
+        return True
+    return False
+
+
+# ------------------------------------------------------- dispatch execution
+
+def start_dispatch(
+    db_path: Path | str | None, dispatch_id: int, operator: Optional[str]
+) -> dict[str, Any]:
+    """凭当前派工开工。
+
+    必须：派工是当前生效的（is_current=1）、状态为 PLANNED、未暂停、工序未开工；
+    当前时刻落在预约时段 [reserved_start, reserved_end) 内；开工仍须满足原有质量
+    放行规则；且「机器、夹具」两项当前都不得停用、也不得被其他**实际开工**工序
+    占着。成功即开始实际占用，直到真实完工才结束。
+    """
+    with _service_lock:
+        conn = get_connection(db_path)
+        try:
+            with _immediate_tx(conn):
+                row = conn.execute(
+                    "SELECT * FROM dispatch WHERE dispatch_id = ?", (dispatch_id,)
+                ).fetchone()
+                if row is None:
+                    raise ServiceError(404, f"派工 {dispatch_id} 不存在")
+                if not row["is_current"]:
+                    raise ServiceError(
+                        409,
+                        f"派工 {dispatch_id} 已被换掉（{row['status']}），不能执行",
+                    )
+                if row["status"] == "SUSPENDED":
+                    raise ServiceError(409, f"派工 {dispatch_id} 已暂停，不能执行；请先重排")
+                if row["status"] == "REPLACED":
+                    raise ServiceError(409, f"派工 {dispatch_id} 已被换掉，不能执行")
+                if row["status"] in ("STARTED", "COMPLETED"):
+                    raise ServiceError(
+                        409, f"派工 {dispatch_id} 状态为 {row['status']}，不能重复开工"
+                    )
+
+                process_id = row["process_id"]
+                state = _get_state(conn, process_id)
+                if state["status"] == "QUARANTINED":
+                    raise ServiceError(409, "工序已隔离，须由质量员复核恢复后才能开工")
+                if state["status"] in ("STARTED", "COMPLETED"):
+                    raise ServiceError(409, f"工序当前状态为 {state['status']}，不能重复开工")
+
+                now = current_ts()
+                if not (row["reserved_start"] <= now < row["reserved_end"]):
+                    raise ServiceError(
+                        409,
+                        f"当前时刻 {now} 不在派工预约时段 "
+                        f"[{row['reserved_start']}, {row['reserved_end']}) 内，不能开工",
+                    )
+
+                # 原有质量放行规则
+                issues = _basis_issues(conn, process_id)
+                if issues:
+                    raise ServiceError(409, "不满足开工条件：" + "；".join(issues))
+
+                # 「当时」两项资源均不得停用，也不得被其他**实际开工**工序占着。
+                # 停用与占用都以开工瞬间 now 判定（半开区间）。
+                if _resource_blocked_at(conn, "MACHINE", row["machine_id"], now):
+                    raise ServiceError(409, "机器在开工时刻处于停用时段，不能开工")
+                if _resource_blocked_at(conn, "FIXTURE", row["fixture_id"], now):
+                    raise ServiceError(409, "夹具在开工时刻处于停用时段，不能开工")
+
+                if _resource_occupied_at(
+                    conn, "MACHINE", row["machine_id"], now, dispatch_id
+                ):
+                    raise ServiceError(409, "机器仍被其他已开工工序实际占用，不能开工")
+                if _resource_occupied_at(
+                    conn, "FIXTURE", row["fixture_id"], now, dispatch_id
+                ):
+                    raise ServiceError(409, "夹具仍被其他已开工工序实际占用，不能开工")
+
+                credential_id = _insert_credential(conn, process_id, "START", operator)
+                wall_now = now_iso()
+                conn.execute(
+                    "UPDATE process_state SET status = 'STARTED', quarantined_at = NULL,"
+                    " reason = NULL WHERE process_id = ?",
+                    (process_id,),
+                )
+                conn.execute(
+                    "UPDATE dispatch SET status = 'STARTED', actual_start_at = ?, updated_at = ?"
+                    " WHERE dispatch_id = ?",
+                    (now, wall_now, dispatch_id),
+                )
+                _record_event(
+                    conn, process_id, "START",
+                    f"凭派工 {dispatch_id} 开工，credential_id={credential_id}", operator,
+                )
+            result = get_process_status(db_path, process_id)
+            result["dispatch"] = get_dispatch(db_path, dispatch_id)
+            return result
+        finally:
+            conn.close()
+
+
+def _resource_blocked_at(
+    conn: sqlite3.Connection, resource_type: str, resource_id: int, at: str
+) -> bool:
+    """资源在给定瞬间是否处于停用时段。"""
+    for d in _downtime_rows(conn, resource_type, resource_id):
+        if d["window_start"] <= at < d["window_end"]:
+            return True
+    return False
+
+
+def _resource_occupied_at(
+    conn: sqlite3.Connection,
+    resource_type: str,
+    resource_id: int,
+    at: str,
+    skip_dispatch_id: int,
+) -> bool:
+    """资源在给定瞬间是否被其他「实际已开工」的派工占着。
+
+    实际占用 = [actual_start_at, actual_end_at)，actual_end_at 为空表示仍在占用；
+    到真实完工才结束，不随预约到期、停机、隔离或复核释放。
+    """
+    col = "machine_id" if resource_type == "MACHINE" else "fixture_id"
+    rows = conn.execute(
+        f"SELECT * FROM dispatch WHERE {col} = ? AND status = 'STARTED'"
+        f" AND dispatch_id <> ?",
+        (resource_id, skip_dispatch_id),
+    ).fetchall()
+    for r in rows:
+        os_ = r["actual_start_at"]
+        oe = r["actual_end_at"] or "9999-12-31T23:59:59.999999+00:00"
+        if os_ <= at < oe:
+            return True
+    return False
+
+
+def list_dispatch_events(db_path: Path | str | None, dispatch_id: int) -> list[dict[str, Any]]:
+    """该派工相关的状态事件（来自工序事件链，按派工 id 过滤）。"""
+    conn = get_connection(db_path)
+    try:
+        row = conn.execute(
+            "SELECT * FROM dispatch WHERE dispatch_id = ?", (dispatch_id,)
+        ).fetchone()
+        if row is None:
+            raise ServiceError(404, f"派工 {dispatch_id} 不存在")
+        return [
+            dict(r)
+            for r in conn.execute(
+                "SELECT * FROM process_event WHERE process_id = ?"
+                " AND detail LIKE ? ORDER BY event_id",
+                (row["process_id"], f"%派工 {dispatch_id}%"),
+            )
+        ]
     finally:
         conn.close()

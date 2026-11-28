@@ -278,6 +278,96 @@ CREATE TABLE IF NOT EXISTS shipment_snapshot_credential (
     credential_kind TEXT,
     PRIMARY KEY (snapshot_id, piece_id)
 );
+
+-- ------------------------------------------------------------------ 班次派工
+-- 一台机器、一副可周转夹具是两种可被预约的独占资源。派工把一个未开工工序
+-- 编入一个班次，并在 [reserved_start, reserved_end) 内连续占用「机器 + 夹具」。
+-- 所有区间均为左闭右开，且预约从整分钟开始。
+
+CREATE TABLE IF NOT EXISTS machine (
+    machine_id  INTEGER PRIMARY KEY AUTOINCREMENT,
+    code        TEXT NOT NULL UNIQUE,
+    name        TEXT NOT NULL,
+    created_at  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS fixture (
+    fixture_id  INTEGER PRIMARY KEY AUTOINCREMENT,
+    code        TEXT NOT NULL UNIQUE,
+    name        TEXT NOT NULL,
+    created_at  TEXT NOT NULL
+);
+
+-- 资源停用时段：对机器或夹具按 resource_type 区分。停用是资源级事实，
+-- 与班次无关；登记后由该班次的重排动作消费。
+CREATE TABLE IF NOT EXISTS resource_downtime (
+    downtime_id   INTEGER PRIMARY KEY AUTOINCREMENT,
+    resource_type TEXT NOT NULL CHECK (resource_type IN ('MACHINE', 'FIXTURE')),
+    resource_id   INTEGER NOT NULL,
+    window_start  TEXT NOT NULL,
+    window_end    TEXT NOT NULL,
+    operator      TEXT,
+    note          TEXT,
+    created_at    TEXT NOT NULL,
+    CHECK (window_start < window_end)
+);
+CREATE INDEX IF NOT EXISTS idx_downtime_resource
+    ON resource_downtime(resource_type, resource_id, window_start);
+
+CREATE TABLE IF NOT EXISTS shift (
+    shift_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+    code         TEXT NOT NULL UNIQUE,
+    operator     TEXT NOT NULL,
+    window_start TEXT NOT NULL,
+    window_end   TEXT NOT NULL,
+    status       TEXT NOT NULL CHECK (status IN ('PUBLISHED', 'COMPLETED')),
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL,
+    CHECK (window_start < window_end)
+);
+
+-- 每次派工尝试一行；is_current=1 表示该工序当前生效的那次派工。被重排换掉的
+-- 旧派工保留为 REPLACED，暂停的保留为 SUSPENDED，均不再可执行。
+-- 部分唯一索引保证一道工序在任一时刻最多只有一个当前派工（也就只能出现在
+-- 一个班次里）。
+CREATE TABLE IF NOT EXISTS dispatch (
+    dispatch_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    shift_id         INTEGER NOT NULL REFERENCES shift(shift_id),
+    process_id       INTEGER NOT NULL REFERENCES process(process_id),
+    machine_id       INTEGER NOT NULL REFERENCES machine(machine_id),
+    fixture_id       INTEGER NOT NULL REFERENCES fixture(fixture_id),
+    window_start     TEXT NOT NULL,
+    window_end       TEXT NOT NULL,
+    duration_minutes INTEGER NOT NULL CHECK (duration_minutes > 0),
+    reserved_start   TEXT NOT NULL,
+    reserved_end     TEXT NOT NULL,
+    status           TEXT NOT NULL CHECK (
+                         status IN ('PLANNED', 'STARTED', 'COMPLETED',
+                                    'SUSPENDED', 'REPLACED')),
+    is_current       INTEGER NOT NULL CHECK (is_current IN (0, 1)),
+    actual_start_at  TEXT,
+    actual_end_at    TEXT,
+    created_at       TEXT NOT NULL,
+    updated_at       TEXT NOT NULL,
+    CHECK (window_start < window_end),
+    CHECK (reserved_start < reserved_end)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_current_dispatch_process
+    ON dispatch(process_id) WHERE is_current = 1;
+CREATE INDEX IF NOT EXISTS idx_dispatch_shift ON dispatch(shift_id);
+CREATE INDEX IF NOT EXISTS idx_dispatch_resource_time
+    ON dispatch(machine_id, reserved_start);
+CREATE INDEX IF NOT EXISTS idx_dispatch_fixture_time
+    ON dispatch(fixture_id, reserved_start);
+
+-- 该次派工允许的「机器、夹具」组合（请求时给出的全部备选，含最终选中者）。
+-- 重排时只能在原备选内换组合。
+CREATE TABLE IF NOT EXISTS dispatch_option (
+    dispatch_id INTEGER NOT NULL REFERENCES dispatch(dispatch_id),
+    machine_id  INTEGER NOT NULL REFERENCES machine(machine_id),
+    fixture_id  INTEGER NOT NULL REFERENCES fixture(fixture_id),
+    PRIMARY KEY (dispatch_id, machine_id, fixture_id)
+);
 """
 
 

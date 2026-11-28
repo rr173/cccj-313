@@ -377,3 +377,139 @@ def gauge_window_impact(gauge_id: int, window_id: int) -> list[dict]:
     """哪些发运单的哪些整件 / 成员，其发运凭据曾引用该量具在该窗内的测量。"""
     return services.find_gauge_impact(DB_PATH, gauge_id, window_id)
 
+
+
+# ------------------------------------------------------------------ 班次派工
+
+@app.post("/api/machines", response_model=schemas.MachineOut, status_code=201, tags=["班次派工"])
+def create_machine(payload: schemas.MachineCreate) -> dict:
+    return services.create_machine(DB_PATH, payload.code, payload.name)
+
+
+@app.get("/api/machines", response_model=list[schemas.MachineOut], tags=["班次派工"])
+def list_machines() -> list[dict]:
+    return services.list_machines(DB_PATH)
+
+
+@app.post("/api/fixtures", response_model=schemas.FixtureOut, status_code=201, tags=["班次派工"])
+def create_fixture(payload: schemas.FixtureCreate) -> dict:
+    return services.create_fixture(DB_PATH, payload.code, payload.name)
+
+
+@app.get("/api/fixtures", response_model=list[schemas.FixtureOut], tags=["班次派工"])
+def list_fixtures() -> list[dict]:
+    return services.list_fixtures(DB_PATH)
+
+
+@app.post(
+    "/api/resource-downtimes",
+    response_model=schemas.ResourceDowntimeOut,
+    status_code=201,
+    tags=["班次派工"],
+)
+def register_downtime(payload: schemas.ResourceDowntimeCreate) -> dict:
+    """登记机器 / 夹具停用时段（资源级事实，不改动已有派工）。"""
+    return services.register_resource_downtime(
+        DB_PATH,
+        payload.resource_type,
+        payload.resource_id,
+        payload.window_start,
+        payload.window_end,
+        payload.operator,
+        payload.note,
+    )
+
+
+@app.get(
+    "/api/resource-downtimes",
+    response_model=list[schemas.ResourceDowntimeOut],
+    tags=["班次派工"],
+)
+def list_downtimes(
+    resource_type: Optional[str] = None, resource_id: Optional[int] = None
+) -> list[dict]:
+    return services.list_resource_downtimes(DB_PATH, resource_type, resource_id)
+
+
+@app.post(
+    "/api/shifts",
+    response_model=schemas.ShiftOut,
+    status_code=201,
+    tags=["班次派工"],
+)
+def create_shift(payload: schemas.ShiftCreate) -> dict:
+    """创建班次并为全班一次性排定；排不齐则整单不发布。"""
+    return services.create_shift(DB_PATH, payload.model_dump())
+
+
+@app.get("/api/shifts", response_model=list[schemas.ShiftOut], tags=["班次派工"])
+def list_shifts() -> list[dict]:
+    return services.list_shifts(DB_PATH)
+
+
+@app.get("/api/shifts/{shift_id}", response_model=schemas.ShiftOut, tags=["班次派工"])
+def get_shift(shift_id: int) -> dict:
+    """查班次：每道工序的安排，以及是否已暂停 / 开工 / 完工。"""
+    return services.get_shift(DB_PATH, shift_id)
+
+
+@app.post(
+    "/api/shifts/{shift_id}/reschedule",
+    response_model=schemas.RescheduleOut,
+    tags=["班次派工"],
+)
+def reschedule_shift(shift_id: int, payload: schemas.ShiftRescheduleRequest) -> dict:
+    """（可选同事务登记停用后）重排本班次：能全排则一起换新，排不齐则暂停冲突项。"""
+    downtime = None
+    if payload.resource_type is not None:
+        if payload.resource_id is None or payload.window_start is None or payload.window_end is None:
+            raise services.ServiceError(
+                422, "登记停用需同时给出 resource_id / window_start / window_end"
+            )
+        downtime = {
+            "resource_type": payload.resource_type,
+            "resource_id": payload.resource_id,
+            "window_start": payload.window_start,
+            "window_end": payload.window_end,
+            "note": payload.note,
+        }
+    return services.reschedule_shift(DB_PATH, shift_id, payload.operator, downtime)
+
+
+@app.get("/api/dispatches", response_model=list[schemas.DispatchOut], tags=["班次派工"])
+def list_dispatches(shift_id: Optional[int] = None) -> list[dict]:
+    return services.list_dispatches(DB_PATH, shift_id)
+
+
+@app.get("/api/dispatches/{dispatch_id}", response_model=schemas.DispatchOut, tags=["班次派工"])
+def get_dispatch(dispatch_id: int) -> dict:
+    return services.get_dispatch(DB_PATH, dispatch_id)
+
+
+@app.get(
+    "/api/processes/{process_id}/dispatches",
+    response_model=list[schemas.DispatchOut],
+    tags=["班次派工"],
+)
+def process_dispatches(process_id: int) -> list[dict]:
+    """该工序的全部派工历史（含已被换掉 / 暂停的旧派工）。"""
+    return services.get_process_dispatches(DB_PATH, process_id)
+
+
+@app.get(
+    "/api/dispatches/{dispatch_id}/events",
+    response_model=list[schemas.ProcessEventOut],
+    tags=["班次派工"],
+)
+def dispatch_events(dispatch_id: int) -> list[dict]:
+    return services.list_dispatch_events(DB_PATH, dispatch_id)
+
+
+@app.post(
+    "/api/dispatches/{dispatch_id}/start",
+    response_model=schemas.DispatchStartOut,
+    tags=["班次派工"],
+)
+def start_dispatch(dispatch_id: int, payload: schemas.ActionRequest) -> dict:
+    """凭当前派工开工：须在预约时段内、满足质量放行规则、两项资源当前都可用。"""
+    return services.start_dispatch(DB_PATH, dispatch_id, payload.operator)
